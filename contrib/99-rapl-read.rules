@@ -1,0 +1,18 @@
+# Libera leitura de energy_uj (RAPL) pro usuário comum.
+#
+# Desde a mitigação da CVE-2020-8694, o kernel restringe /sys/class/powercap/
+# intel-rapl:*/energy_uj a root — um usuário sem privilégio podia usar o
+# contador de energia como canal lateral pra inferir dados de outros
+# processos/VMs. Essa regra reabre a leitura pra todo mundo local
+# (SPECS.md §6.5): em desktop pessoal de um usuário só, esse canal lateral
+# teórico é risco baixíssimo, mas em máquina compartilhada ou multiusuário
+# pense duas vezes antes de instalar.
+#
+# Instalação (não é automática, precisa de sudo):
+#   sudo cp contrib/99-rapl-read.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=powercap
+#
+# Teste depois de instalar: cat /sys/class/powercap/intel-rapl:0/energy_uj
+
+SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", RUN+="/bin/chmod 0444 /sys%p/energy_uj"

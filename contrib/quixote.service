@@ -1,0 +1,22 @@
+[Unit]
+Description=Quixote solo Bitcoin miner
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__QUIXOTE_DIR__/.venv/bin/quixote daemon
+Restart=on-failure
+RestartSec=30
+Nice=19
+# Rede de segurança, não o throttle: o hasher já se auto-limita em
+# core/hasher.py (target_hashrate). CPUQuota só existe pra garantir que,
+# se esse cálculo tiver um bug e rodar sem freio, o processo não passa
+# disso e trava o resto da máquina — ver contrib/README.md.
+CPUQuota=65%
+CPUWeight=1
+IOWeight=1
+MemoryMax=200M
+OOMScoreAdjust=800
+
+[Install]
+WantedBy=default.target

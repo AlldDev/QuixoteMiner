@@ -1,0 +1,38 @@
+[project]
+name = "quixote"
+version = "0.1.0"
+description = "Minerador solo de Bitcoin didático, com hashrate limitado de propósito."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# quixote_native (Rust, rust/quixote_native/) não entra aqui: não é
+# publicável via PyPI, é construído localmente com `maturin develop
+# --release` — passo obrigatório de instalação, ver contrib/README.md.
+# `maturin` em si vem só de `dnf` (junto de `rust`/`cargo`, que não têm
+# alternativa via pip) — uma fonte só pro toolchain inteiro, não duas.
+dependencies = ["rich"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+quixote = "quixote.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["quixote*"]
+
+[tool.pytest.ini_options]
+markers = ["slow: testes de integração real com o pool, rodar manualmente"]
+
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = "quixote_native"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100

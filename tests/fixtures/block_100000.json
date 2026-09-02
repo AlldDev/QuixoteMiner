@@ -1,0 +1,25 @@
+{
+  "height": 100000,
+  "version": 1,
+  "prev_hash_display": "000000000002d01c1fccc21636b607dfd930d31d01c3a62104612a1719011250",
+  "merkle_root_display": "f3e94742aca4b5ef85488dc37c06c3282295ffec960994b2c0d5ac2a25a95766",
+  "ntime": 1293623863,
+  "nbits_hex": "1b04864c",
+  "nonce": 274148111,
+  "block_hash_display": "000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506",
+  "txids_display": [
+    "8c14f0db3df150123e6f3dbbf30f8b955a8249b62ac1d1ff16284aefa3d06d87",
+    "fff2525b8931402dd09222c50775608f75787bd2b87e56995a7bdd30f79702c4",
+    "6359f0868171b1d194cbee1af2f16ea598ae8fad666d9b012c8ed2b79a236ec4",
+    "e9a66845e05d5abc0ad04ec80f774a7e585c6e8db975962d069a522137b80c1d"
+  ],
+  "coinbase_raw_hex": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08044c86041b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac00000000",
+  "coinbase_split": {
+    "coinb1": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff08",
+    "extranonce1": "044c",
+    "extranonce2": "8604",
+    "coinb2": "1b020602ffffffff0100f2052a010000004341041b0e8c2567c12536aa13357b79a073dc4444acb83c4ec7a0e2f99dd7457516c5817242da796924ca4e99947d087fedf9ce467cb9f7c6287078f801df276fdf84ac00000000"
+  },
+  "note": "coinb1/extranonce1/extranonce2/coinb2 sao um recorte arbitrario da coinbase real deste bloco (nao veio de um job stratum de verdade), so para provar que build_coinbase concatena certo e reproduz o txid e o merkle root reais.",
+  "source": "https://blockstream.info/api/block/000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506, conferido em 2026-09-01"
+}

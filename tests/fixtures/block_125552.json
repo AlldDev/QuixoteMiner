@@ -1,0 +1,12 @@
+{
+  "height": 125552,
+  "version": 1,
+  "prev_hash_display": "00000000000008a3a41b85b8b29ad444def299fee21793cd8b9e567eab02cd81",
+  "merkle_root_display": "2b12fcf1b09288fcaff797d71e950e71ae42b91e8bdb2304758dfcffc2b620e3",
+  "ntime": 1305998791,
+  "nbits_hex": "1a44b9f2",
+  "nonce": 2504433986,
+  "block_hash_display": "00000000000000001e8d6829a8a21adc5d38d0a473b144b6765798e61f98bd1d",
+  "network_difficulty": 244112.48777433642,
+  "source": "https://blockstream.info/api/block/00000000000000001e8d6829a8a21adc5d38d0a473b144b6765798e61f98bd1d, conferido em 2026-09-01"
+}
