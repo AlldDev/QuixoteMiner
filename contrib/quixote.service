@@ -12,7 +12,7 @@ Nice=19
 # core/hasher.py (target_hashrate). CPUQuota só existe pra garantir que,
 # se esse cálculo tiver um bug e rodar sem freio, o processo não passa
 # disso e trava o resto da máquina — ver contrib/README.md.
-CPUQuota=65%
+CPUQuota=30%
 CPUWeight=1
 IOWeight=1
 MemoryMax=200M

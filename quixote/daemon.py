@@ -21,7 +21,7 @@ from quixote.net.stratum import StratumClient
 from quixote.telemetry import ipc
 from quixote.telemetry.power import PowerMeter
 from quixote.telemetry.state import SharedState
-from quixote.ui.explain import explicar_job
+from quixote.ui.explain import explicar_job, montar_explicacao_job
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +143,22 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
         job_box.set(job)
         network_difficulty = target_to_difficulty(nbits_to_target(job.nbits))
         block_height = parse_coinbase_height(job.coinb1)
+        explicacao = montar_explicacao_job(
+            job,
+            client.extranonce1,
+            client.extranonce2_size,
+            client.pool_difficulty,
+            target_hashrate,
+            batch_size,
+            state.calibrated_max_hashrate,
+        )
         state.update_job(
-            job.job_id, client.pool_difficulty, network_difficulty, block_height, job.ntime
+            job.job_id,
+            client.pool_difficulty,
+            network_difficulty,
+            block_height,
+            job.ntime,
+            explicacao,
         )
         if explain and not explained:
             explained = True

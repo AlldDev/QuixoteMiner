@@ -2,7 +2,7 @@
 
 from quixote.core.job import Job
 from quixote.core.merkle import build_coinbase, coinbase_txid, compute_merkle_root
-from quixote.ui.explain import explicar_job
+from quixote.ui.explain import explicar_job, montar_explicacao_job
 
 EXTRANONCE1 = "aa11bb22"
 EXTRANONCE2_SIZE = 4
@@ -68,3 +68,25 @@ def test_explicar_job_sem_capacidade_calibrada_nao_lanca(capsys):
 
     saida = capsys.readouterr().out
     assert "capacidade calibrada" not in saida
+
+
+def test_montar_explicacao_job_devolve_o_mesmo_texto_que_explicar_job_imprime(capsys):
+    """`explicar_job` é um wrapper fino sobre `montar_explicacao_job` — os dois batem."""
+    job = _job()
+    kwargs = {
+        "extranonce1": EXTRANONCE1,
+        "extranonce2_size": EXTRANONCE2_SIZE,
+        "pool_difficulty": 1.0,
+        "target_hashrate": 350_000.0,
+        "batch_size": 2000,
+        "calibrated_max_hashrate": 1_000_000.0,
+    }
+
+    texto = montar_explicacao_job(job, **kwargs)
+    explicar_job(job, **kwargs)
+    saida = capsys.readouterr().out
+
+    assert saida == texto + "\n"
+    assert "EXPLICAÇÃO DO JOB job-teste" in texto
+    assert "TARGET EXPANDIDO" in texto
+    assert "CÁLCULO DO THROTTLE" in texto

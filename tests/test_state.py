@@ -24,6 +24,8 @@ def test_to_dict_traz_todos_os_campos(tmp_path):
         "network_difficulty",
         "shares_accepted",
         "shares_rejected",
+        "shares_accepted_total",
+        "shares_rejected_total",
         "last_rejection_reason",
         "best_difficulty_session",
         "best_difficulty_ever",
@@ -117,8 +119,28 @@ def test_shares_aceitas_e_rejeitadas(tmp_path):
     snapshot = state.to_dict()
     assert snapshot["shares_accepted"] == 2
     assert snapshot["shares_rejected"] == 1
+    assert snapshot["shares_accepted_total"] == 2
+    assert snapshot["shares_rejected_total"] == 1
     assert snapshot["last_rejection_reason"] == "Invalid ntime"
     assert snapshot["last_share_timestamp"] is not None
+
+
+def test_shares_total_persiste_e_soma_entre_sessoes(tmp_path):
+    path = tmp_path / "state.json"
+
+    state1 = SharedState(persistence_path=path)
+    state1.record_share_accepted()
+    state1.record_share_rejected("Invalid ntime")
+
+    state2 = SharedState(persistence_path=path)
+    snapshot = state2.to_dict()
+    assert snapshot["shares_accepted_total"] == 1
+    assert snapshot["shares_rejected_total"] == 1
+    assert snapshot["shares_accepted"] == 0  # sessão nova, zerada
+    assert snapshot["shares_rejected"] == 0
+
+    state2.record_share_accepted()
+    assert state2.to_dict()["shares_accepted_total"] == 2  # soma com o que já vinha persistido
 
 
 def test_best_difficulty_ever_persiste_em_disco(tmp_path):
@@ -205,6 +227,24 @@ def test_update_job_propaga_altura_ntime_e_target_hashrate(tmp_path):
     state.update_job("job2", pool_difficulty=1.0, network_difficulty=100_000.0)
     assert state.to_dict()["current_block_height"] is None
     assert state.to_dict()["current_ntime"] is None
+
+
+def test_update_job_propaga_explicacao_pro_snapshot(tmp_path):
+    """A explicação calculada pelo daemon (`e` no painel) viaja no snapshot."""
+    state = SharedState(persistence_path=tmp_path / "state.json")
+    assert state.to_dict()["current_job_explanation"] is None
+
+    state.update_job(
+        "job1",
+        pool_difficulty=1.0,
+        network_difficulty=100_000.0,
+        explanation="EXPLICAÇÃO DO JOB job1",
+    )
+    assert state.to_dict()["current_job_explanation"] == "EXPLICAÇÃO DO JOB job1"
+
+    # job novo sem explicação (chamada que não a calculou) não deixa lixo do job anterior
+    state.update_job("job2", pool_difficulty=1.0, network_difficulty=100_000.0)
+    assert state.to_dict()["current_job_explanation"] is None
 
 
 def test_arquivo_persistido_corrompido_nao_derruba(tmp_path):

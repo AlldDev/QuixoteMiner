@@ -39,6 +39,8 @@ class _Persisted:
     best_difficulty_ever_timestamp: float | None = None
     calibrated_max_hashrate: float | None = None
     kwh_total: float = 0.0
+    shares_accepted_total: int = 0
+    shares_rejected_total: int = 0
 
 
 class SharedState:
@@ -62,6 +64,7 @@ class SharedState:
         self._current_block_height: int | None = None
         self._current_ntime: int | None = None
         self._current_extranonce2: str | None = None
+        self._current_job_explanation: str | None = None
         self._pool_difficulty = 0.0
         self._network_difficulty = 0.0
         self._shares_accepted = 0
@@ -184,6 +187,7 @@ class SharedState:
         network_difficulty: float,
         block_height: int | None = None,
         ntime: int | None = None,
+        explanation: str | None = None,
     ) -> None:
         with self._lock:
             self._current_job_id = job_id
@@ -191,6 +195,7 @@ class SharedState:
             self._network_difficulty = network_difficulty
             self._current_block_height = block_height
             self._current_ntime = ntime
+            self._current_job_explanation = explanation
 
     def update_extranonce2(self, extranonce2: bytes) -> None:
         """Registrado pelo `on_extranonce2_change` de `core.hasher.mine_job`."""
@@ -204,13 +209,17 @@ class SharedState:
     def record_share_accepted(self) -> None:
         with self._lock:
             self._shares_accepted += 1
+            self._persisted.shares_accepted_total += 1
             self._last_share_timestamp = time.time()
+            self._save_persisted()
 
     def record_share_rejected(self, reason: str) -> None:
         with self._lock:
             self._shares_rejected += 1
+            self._persisted.shares_rejected_total += 1
             self._last_rejection_reason = reason
             self._last_share_timestamp = time.time()
+            self._save_persisted()
 
     # --- leitura ---
 
@@ -237,10 +246,13 @@ class SharedState:
                 "current_block_height": self._current_block_height,
                 "current_ntime": self._current_ntime,
                 "current_extranonce2": self._current_extranonce2,
+                "current_job_explanation": self._current_job_explanation,
                 "pool_difficulty": self._pool_difficulty,
                 "network_difficulty": self._network_difficulty,
                 "shares_accepted": self._shares_accepted,
                 "shares_rejected": self._shares_rejected,
+                "shares_accepted_total": self._persisted.shares_accepted_total,
+                "shares_rejected_total": self._persisted.shares_rejected_total,
                 "last_rejection_reason": self._last_rejection_reason,
                 "best_difficulty_session": self._best_difficulty_session,
                 "best_difficulty_ever": self._persisted.best_difficulty_ever,

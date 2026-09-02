@@ -1,13 +1,14 @@
 # QuixoteMiner
 
 <p align="center">
-  <strong>Um minerador solo de Bitcoin para desktop, que sabe que não vai ganhar.</strong>
+  <strong>Um minerador solo de Bitcoin para desktop, que sabe que as chances são astronomicamente pequenas.</strong>
 </p>
 
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="Licença MIT"></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/rust-required-orange" alt="Rust obrigatório">
+  <a href="#apoie-o-projeto"><img src="https://img.shields.io/badge/₿-apoie_o_projeto-F7931A?logo=bitcoin&logoColor=white" alt="Apoie o projeto com Bitcoin"></a>
 </p>
 
 <p align="center">
@@ -19,12 +20,13 @@
   <a href="#aviso">Aviso</a> ·
   <a href="#rodando">Rodando</a> ·
   <a href="#testes">Testes</a> ·
-  <a href="#licença">Licença</a>
+  <a href="#licença">Licença</a> ·
+  <a href="#apoie-o-projeto">Apoie o projeto</a>
 </p>
 
 Quixote conecta numa pool de mineração solo real (`public-pool.io`) e minera Bitcoin de verdade , 
 com o hashrate travado de propósito em 350 KH/s, consumo de 1 a 4 W, e um painel de terminal que
-mostra, sem rodeios, exatamente o quanto essa aposta não vai compensar.
+mostra, sem rodeios, exatamente o quanto essa aposta é desfavorável.
 
 ---
 
@@ -55,7 +57,7 @@ O ciclo é o mesmo de qualquer minerador Bitcoin de verdade:
    monta os 80 bytes do header de bloco.
 4. **Busca de nonce**: varia o campo `nonce` (e, quando necessário, o `extranonce2`) calculando
    `sha256d` do header a cada tentativa, comparando o resultado contra dois alvos diferentes ,  o da
-   pool (baixo, acontece com frequência) e o da rede (real, não vai acontecer).
+   pool (baixo, acontece com frequência) e o da rede (real, extraordinariamente improvável de acontecer).
 5. **`mining.submit`**: quando um hash passa no alvo da pool, submete a solução. A resposta
    `{"result": true}` é a prova de que a mineração é real ,  não uma simulação.
 
@@ -237,3 +239,20 @@ nada; uma resposta `{"result": true}` vinda do pool, sim.
 ## Licença
 
 [MIT](./LICENSE)
+
+---
+
+## Apoie o projeto
+
+<p align="center">
+  <a href="bitcoin:bc1qtu6nvfjdcujpweazeq8w0et0vs7swmef75nurw">
+    <img src="https://img.shields.io/badge/₿_Bitcoin-apoie_o_projeto-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white" alt="Apoie via Bitcoin">
+  </a>
+</p>
+
+<p align="center">
+  Gostou do projeto? Uma doação em Bitcoin, de qualquer valor, ajuda a manter o Quixote
+  atacando moinhos de vento.
+</p>
+
+<p align="center"><code>bc1qtu6nvfjdcujpweazeq8w0et0vs7swmef75nurw</code></p>

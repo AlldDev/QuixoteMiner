@@ -6,11 +6,15 @@ não para a mineração.
 
 Formatação numérica em padrão pt-BR (vírgula decimal, ponto de milhar) em
 todo o painel, por decisão explícita do usuário, consistente com o resto
-da interface já em português. `q` (sair) e `l` (abrir os logs) têm handler
-de teclado de verdade (modo cbreak do terminal, só quando `stdin` é um
-tty). `r` (reconectar) continua só texto — exigiria IPC bidirecional, hoje
-o socket só empurra estado do servidor pro cliente — e `e` (explicar) é
-uma flag de inicialização do daemon (`--explain`), não uma ação do painel.
+da interface já em português. `q` (sair), `l` (abrir os logs) e `e`
+(explicar o job atual) têm handler de teclado de verdade (modo cbreak do
+terminal, só quando `stdin` é um tty). A explicação do job é calculada no
+daemon a cada `mining.notify` (`ui.explain.montar_explicacao_job`) e viaja
+no mesmo snapshot já empurrado por `telemetry.ipc` — não precisou de IPC
+bidirecional porque a explicação é determinística por job (sempre usa
+extranonce2 contador 0), não depende do nonce em andamento. Não há atalho
+de reconexão: esse sim exigiria IPC bidirecional de verdade, hoje o socket
+só empurra estado do servidor pro cliente.
 """
 
 import contextlib
@@ -33,6 +37,7 @@ from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from quixote import envfile
 from quixote.telemetry.ipc import DEFAULT_SOCKET_PATH
@@ -60,6 +65,8 @@ COR_HASHRATE = "#9ece6a"
 COR_ENERGIA = "#bb9af7"
 COR_TRABALHO = "#7aa2f7"
 COR_RESULTADOS = "#9ece6a"
+COR_SISTEMA = "#e0af68"
+COR_EXPLICAR = "#f7768e"  # cartão de destaque do atalho `e`, toma a tela toda enquanto ativo
 COR_LABEL = "#565f89"  # rótulo de todo campo label/valor, sempre este tom — só o valor muda de cor
 COR_EXTRANONCE2 = "#7dcfff"  # único valor com cor própria no mockup, mantido aqui
 
@@ -293,6 +300,28 @@ def _secao_resultados(s: dict[str, Any]) -> Panel:
     return Panel(grid, title=titulo, border_style=COR_BORDA_NEUTRA)
 
 
+def _secao_sistema(s: dict[str, Any], mostrar_progresso: bool) -> Panel:
+    """Cartão de largura total: progresso até o bloco, uptime e uso de CPU."""
+    grid = _grid_campos(
+        (
+            ("uptime", format_uptime(s["uptime_seconds"])),
+            ("cpu (núcleo)", format_numero_ptbr(s["cpu_usage_percent"], 1) + "%"),
+            ("cpu (máquina)", format_numero_ptbr(s["cpu_usage_percent_maquina"], 1) + "%"),
+        ),
+    )
+    itens: list[RenderableType] = []
+    if mostrar_progresso:
+        progresso = progresso_bloco_percent(s["hashes_total"], s["network_difficulty"])
+        itens.append(f"{_barra(progresso / 100)} progresso até o bloco: {progresso:.2e}%")
+    itens.append(grid)
+    titulo = f"[{COR_SISTEMA}]SISTEMA[/{COR_SISTEMA}]"
+    return Panel(Group(*itens), title=titulo, border_style=COR_BORDA_NEUTRA)
+
+
+def _formatar_atalho(tecla: str, acao: str) -> str:
+    return f"[bold black on {COR_SISTEMA}] {tecla.upper()} [/bold black on {COR_SISTEMA}] {acao}"
+
+
 def render(snapshot: dict[str, Any] | None, mostrar_progresso: bool = True) -> Panel:
     """Monta o painel inteiro a partir de um snapshot de `SharedState.to_dict()`.
 
@@ -305,12 +334,14 @@ def render(snapshot: dict[str, Any] | None, mostrar_progresso: bool = True) -> P
         return Panel("aguardando conexão com o daemon...", title="quixote", border_style="yellow")
 
     s = snapshot
-    rodape = (
-        f"uptime {format_uptime(s['uptime_seconds'])}"
-        f"     cpu (uso no núcleo) {format_numero_ptbr(s['cpu_usage_percent'], 1)}%"
-        f"     cpu (uso total da máquina) {format_numero_ptbr(s['cpu_usage_percent_maquina'], 1)}%"
+    atalhos = "   ".join(
+        _formatar_atalho(tecla, acao)
+        for tecla, acao in [
+            ("q", "sair"),
+            ("l", "logs"),
+            ("e", "explicar job atual"),
+        ]
     )
-    atalhos = "q sair · l logs · e explicar job atual · r reconectar"
 
     conexao = s.get("connection_state", "desconectado")
     cor_conexao = CORES_CONEXAO.get(conexao, "white")
@@ -330,12 +361,8 @@ def render(snapshot: dict[str, Any] | None, mostrar_progresso: bool = True) -> P
     grade.add_column(ratio=2)
     grade.add_row(_secao_hashrate(s), coluna_direita)
 
-    itens: list[RenderableType] = [grade]
-    if mostrar_progresso:
-        progresso = progresso_bloco_percent(s["hashes_total"], s["network_difficulty"])
-        itens.append(f"{_barra(progresso / 100)} progresso até o bloco: {progresso:.2e}%")
-    itens.append(rodape)
-    itens.append(f"[dim]{atalhos}[/dim]")
+    itens: list[RenderableType] = [grade, _secao_sistema(s, mostrar_progresso)]
+    itens.append(atalhos)
 
     corpo = Group(*itens)
     titulo = f"quixote — public-pool.io — [{cor_conexao}]{conexao.upper()}[/{cor_conexao}]"
@@ -408,22 +435,108 @@ def _esperar_tecla_ou_intervalo(interativo: bool, timeout: float) -> str | None:
     return sys.stdin.read(1) if prontos else None
 
 
+ESCAPE_PARA_TOKEN = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
+
+
+def _ler_tecla_navegacao() -> str:
+    """Bloqueia até uma tecla, decodificando setas/PageUp/PageDown em tokens.
+
+    Setas e PageUp/PageDown chegam como sequência de escape (`ESC [ A`,
+    `ESC [ 5 ~`, etc.), não um caractere só — sem decodificar isso, `_ler`
+    devolveria só o `ESC` (ou o `[`/dígito seguinte) e a rolagem pareceria
+    travada. A maioria dos terminais (xterm, gnome-terminal, iTerm, kitty,
+    alacritty...) mapeia a roda do mouse pra essas mesmas setas quando o
+    programa está na alternate screen sem suporte a scroll nativo — então
+    decodificar as setas também resolve a rolagem por mouse "de graça".
+    Qualquer outra tecla volta como veio, pro chamador decidir (ex.: sair).
+    """
+    tecla = sys.stdin.read(1)
+    if tecla != "\x1b":
+        return tecla
+    prontos, _, _ = select.select([sys.stdin], [], [], 0.05)
+    if not prontos:
+        return tecla  # ESC sozinho, sem sequência vindo atrás
+    if sys.stdin.read(1) != "[":
+        return tecla
+    codigo = sys.stdin.read(1)
+    if codigo in "56":
+        select.select([sys.stdin], [], [], 0.05)
+        sys.stdin.read(1)  # descarta o '~' final de ESC[5~/ESC[6~
+    return ESCAPE_PARA_TOKEN.get(codigo, tecla)
+
+
+def _avisar_log(console: Console, mensagem: str) -> None:
+    """Mostra um aviso de `_abrir_logs` num Panel com a borda do tema, não texto cru.
+
+    O `less` em si (caminho feliz) não pode ser bordado — assume a tela
+    inteira — mas os avisos de fallback (sem `LOG_FILE`, `$PAGER` ausente)
+    são nosso próprio texto, então ganham a mesma moldura dos outros
+    cartões do painel.
+    """
+    console.print(Panel(mensagem, title="LOGS", border_style=COR_BORDA_NEUTRA))
+    input("Pressione Enter pra voltar ao painel...")
+
+
 def _abrir_logs(live: Live, log_file: str | None) -> None:
     """Suspende o painel (sai do alternate screen) pra mostrar os logs, depois volta."""
     live.stop()
     try:
+        console = Console()
         if not log_file:
-            print("\nLOG_FILE não configurado em .env — nada pra mostrar.")
-            input("Pressione Enter pra voltar ao painel...")
+            _avisar_log(console, "LOG_FILE não configurado em .env — nada pra mostrar.")
         else:
             pager = os.environ.get("PAGER", "less")
             try:
                 subprocess.run(_comando_pager(pager, log_file), check=False)
             except FileNotFoundError:
-                print(f"\n$PAGER={pager!r} não encontrado.")
-                input("Pressione Enter pra voltar ao painel...")
+                _avisar_log(console, f"$PAGER={pager!r} não encontrado.")
     finally:
         live.start(refresh=True)
+
+
+LINHAS_RESERVADAS_EXPLICACAO = 4
+"""2 linhas de borda do Panel + linha em branco + rodapé de ajuda/paginação."""
+
+
+def _mostrar_explicacao(live: Live, snapshot: dict[str, Any] | None) -> None:
+    """Mostra a explicação do job atual num cartão próprio, navegável até sair.
+
+    Diferente de `_abrir_logs`, não sai do Rich/alternate screen — a
+    explicação já chega pronta no snapshot (calculada pelo daemon a cada
+    job, ver docstring do módulo). Como pode ser mais longa que a tela (e a
+    alternate screen não tem scrollback), pagina manualmente: setas/roda do
+    mouse rolam linha a linha, PageUp/PageDown rolam página inteira
+    (`_ler_tecla_navegacao` decodifica as sequências de escape), qualquer
+    outra tecla volta ao painel.
+    """
+    explicacao = snapshot.get("current_job_explanation") if snapshot else None
+    linhas = (explicacao or "aguardando o primeiro job pra explicar...").split("\n")
+    titulo = f"[{COR_EXPLICAR}]EXPLICAR JOB[/{COR_EXPLICAR}]"
+
+    offset = 0
+    while True:
+        altura_visivel = max(1, live.console.size.height - LINHAS_RESERVADAS_EXPLICACAO)
+        offset_max = max(0, len(linhas) - altura_visivel)
+        offset = min(offset, offset_max)
+        janela = linhas[offset : offset + altura_visivel]
+
+        rodape = "↑/↓ ou roda do mouse rola · PgUp/PgDn pula página · outra tecla volta"
+        if offset_max > 0:
+            rodape += f"    [{offset + 1}-{offset + len(janela)}/{len(linhas)}]"
+        corpo = Text("\n".join(janela) + "\n\n" + rodape)
+        live.update(Panel(corpo, title=titulo, border_style=COR_EXPLICAR))
+
+        tecla = _ler_tecla_navegacao()
+        if tecla == "up":
+            offset = max(0, offset - 1)
+        elif tecla == "down":
+            offset = min(offset_max, offset + 1)
+        elif tecla == "pgup":
+            offset = max(0, offset - altura_visivel)
+        elif tecla == "pgdn":
+            offset = min(offset_max, offset + altura_visivel)
+        else:
+            return
 
 
 def run(sock_path: Path = DEFAULT_SOCKET_PATH) -> None:
@@ -458,6 +571,9 @@ def run(sock_path: Path = DEFAULT_SOCKET_PATH) -> None:
                     break
                 if tecla and tecla.lower() == "l":
                     _abrir_logs(live, log_file)
+                    continue
+                if tecla and tecla.lower() == "e":
+                    _mostrar_explicacao(live, estado.snapshot)
                     continue
                 live.update(render(estado.snapshot, mostrar_progresso))
     except KeyboardInterrupt:
