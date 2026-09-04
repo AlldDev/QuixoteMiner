@@ -159,22 +159,59 @@ def test_best_difficulty_ever_persiste_em_disco(tmp_path):
     assert state2.to_dict()["best_difficulty_session"] == 1.0  # sessão é independente
 
 
-def test_calibrated_max_hashrate_persiste_em_disco(tmp_path):
+def test_calibracao_persiste_em_disco_com_idade(tmp_path):
     path = tmp_path / "state.json"
 
     state1 = SharedState(persistence_path=path)
-    state1.set_calibrated_max_hashrate(21_000_000.0)
+    state1.set_calibration(21_000_000.0, joules_per_hash=1.28e-6)
 
     state2 = SharedState(persistence_path=path)
     assert state2.calibrated_max_hashrate == 21_000_000.0
+    assert state2.joules_per_hash == 1.28e-6
+    idade = state2.calibration_age_seconds
+    assert idade is not None and idade < 60  # acabou de calibrar
+
+
+def test_calibracao_sem_idade_conta_como_ausente(tmp_path):
+    """Estado gravado por uma versão anterior (sem `calibrated_at`) não pode
+    passar por calibração recente — é o caso que fez o painel mostrar uma
+    capacidade velha por 4,7x até 2026-09-03."""
+    path = tmp_path / "state.json"
+    path.write_text('{"calibrated_max_hashrate": 1405693.99}')
+
+    state = SharedState(persistence_path=path)
+
+    assert state.calibrated_max_hashrate == 1405693.99
+    assert state.calibration_age_seconds is None
+    assert state.joules_per_hash is None
+
+
+def test_calibracao_sem_rapl_grava_none_e_nao_reaproveita(tmp_path):
+    """Sem RAPL o J/hash vai a `None` de propósito: melhor cair na estratégia
+    estimada que reusar um valor calibrado noutra máquina."""
+    path = tmp_path / "state.json"
+
+    state1 = SharedState(persistence_path=path)
+    state1.set_calibration(21_000_000.0, joules_per_hash=1.28e-6)
+    state1.set_calibration(21_000_000.0, joules_per_hash=None)
+
+    assert SharedState(persistence_path=path).joules_per_hash is None
+
+
+def test_hashrate_instant_legivel_direto_sem_montar_snapshot(tmp_path):
+    """O loop de monitor lê isto a 1 Hz pra converter em watts."""
+    state = SharedState(persistence_path=tmp_path / "state.json")
+
+    assert state.hashrate_instant == 0.0
+    state.update_hashrate(350_000.0, hashes_no_lote=50_000)
+    assert state.hashrate_instant == 350_000.0
 
 
 def test_update_power_acumula_kwh_e_calcula_custo_so_com_tarifa(tmp_path):
     state = SharedState(persistence_path=tmp_path / "state.json")
 
-    state.update_power(watts=30.0, watts_avg=28.0, strategy="ESTIMADO", kwh_delta=0.001)
+    state.update_power(watts_avg=28.0, strategy="ESTIMADO", kwh_delta=0.001)
     snapshot = state.to_dict()
-    assert snapshot["watts_instant"] == 30.0
     assert snapshot["watts_avg"] == 28.0
     assert snapshot["power_strategy"] == "ESTIMADO"
     assert snapshot["kwh_session"] == 0.001
@@ -183,24 +220,36 @@ def test_update_power_acumula_kwh_e_calcula_custo_so_com_tarifa(tmp_path):
     assert snapshot["cost_total_brl"] is None
 
     state.set_tariff_brl_per_kwh(1.0)
-    state.update_power(watts=30.0, watts_avg=28.0, strategy="ESTIMADO", kwh_delta=0.001)
+    state.update_power(watts_avg=28.0, strategy="ESTIMADO", kwh_delta=0.001)
     snapshot = state.to_dict()
     assert snapshot["kwh_session"] == 0.002
     assert snapshot["cost_session_brl"] == 0.002
     assert snapshot["cost_total_brl"] == 0.002
 
 
+def test_set_watts_instant_escreve_direto_sem_depender_de_update_power(tmp_path):
+    """`set_watts_instant` escreve o valor recebido direto, sem transformação,
+    separado de `update_power` (média/kWh) — mesmo loop de monitor alimenta os dois."""
+    state = SharedState(persistence_path=tmp_path / "state.json")
+
+    state.set_watts_instant(28.0)
+    assert state.to_dict()["watts_instant"] == 28.0
+
+    state.set_watts_instant(0.0)
+    assert state.to_dict()["watts_instant"] == 0.0
+
+
 def test_kwh_total_persiste_e_soma_entre_sessoes(tmp_path):
     path = tmp_path / "state.json"
 
     state1 = SharedState(persistence_path=path)
-    state1.update_power(watts=30.0, watts_avg=30.0, strategy="ESTIMADO", kwh_delta=0.5)
+    state1.update_power(watts_avg=30.0, strategy="ESTIMADO", kwh_delta=0.5)
 
     state2 = SharedState(persistence_path=path)
     assert state2.to_dict()["kwh_total"] == 0.5
     assert state2.to_dict()["kwh_session"] == 0.0  # sessão nova, zerada
 
-    state2.update_power(watts=30.0, watts_avg=30.0, strategy="ESTIMADO", kwh_delta=0.5)
+    state2.update_power(watts_avg=30.0, strategy="ESTIMADO", kwh_delta=0.5)
     assert state2.to_dict()["kwh_total"] == 1.0  # soma com o que já vinha persistido
 
 

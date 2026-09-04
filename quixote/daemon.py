@@ -19,7 +19,7 @@ from quixote.core.job import Job, Share, parse_coinbase_height
 from quixote.core.target import difficulty_to_target, nbits_to_target, target_to_difficulty
 from quixote.net.stratum import StratumClient
 from quixote.telemetry import ipc
-from quixote.telemetry.power import PowerMeter
+from quixote.telemetry.power import EnergyProbe, PowerMeter, joules_per_hash
 from quixote.telemetry.state import SharedState
 from quixote.ui.explain import explicar_job, montar_explicacao_job
 
@@ -31,7 +31,64 @@ limitação. `.env` (TARGET_HASHRATE) permite sobrescrever sem tocar aqui.
 Único fallback em código desta lista: é proteção deliberada contra um
 `.env` ausente/quebrado, não uma configuração comum (ver `envfile.py`)."""
 MONITOR_INTERVAL_SECONDS = 1.0
-POWER_STRATEGY_CHOICES = ("auto", "model")
+
+CALIBRATION_MAX_AGE_SECONDS = 3 * 24 * 3600
+"""Calibração mais velha que isso é refeita. Ela mede hardware (capacidade
+de hash e joules por hash), e hardware não muda sozinho — mas o resto muda:
+outro perfil de energia, outro kernel, o binário Rust recompilado, a máquina
+virada de mesa pra notebook na bateria. Três dias é a escolha do usuário
+(2026-09-03); o custo de errar pra menos é ~5s de inicialização."""
+
+CALIBRATION_IDLE_SECONDS = 2.0
+"""Janela ociosa medida antes da corrida de calibração, pra descontar do
+consumo o que a máquina já gastava parada."""
+
+
+def _calibrar(state: SharedState) -> None:
+    """Mede capacidade máxima de hash e custo energético por hash, e persiste.
+
+    As duas saem da mesma corrida sem throttle: primeiro uma janela parada
+    (linha de base do RAPL), depois `calibrate_max_hashrate` com o contador
+    de energia aberto em volta. Roda antes das threads de Stratum e do hasher
+    subirem, então o único ruído possível é de processos de fora.
+    """
+    probe = EnergyProbe()
+    if not probe.available:
+        logger.info(
+            "contador de energia do RAPL indisponível (permissão ou CPU sem suporte) — "
+            "watts vão sair do modelo TDP, ver contrib/README.md"
+        )
+
+    logger.info("medindo linha de base ociosa (%.0fs)...", CALIBRATION_IDLE_SECONDS)
+    idle_watts = probe.measure(CALIBRATION_IDLE_SECONDS)
+
+    logger.info("calibrando capacidade máxima da máquina (3s sem throttle)...")
+    probe.start()
+    max_hashrate = calibrate_max_hashrate()
+    busy_watts = probe.stop()
+
+    j_por_hash = (
+        joules_per_hash(idle_watts, busy_watts, max_hashrate)
+        if idle_watts is not None and busy_watts is not None
+        else None
+    )
+    state.set_calibration(max_hashrate, j_por_hash)
+
+    logger.info("capacidade calibrada: %.0f H/s", max_hashrate)
+    if j_por_hash is not None:
+        logger.info(
+            "custo de energia calibrado: %.3f µJ por hash (ocioso %.2f W, sob carga %.2f W)",
+            j_por_hash * 1e6,
+            idle_watts,
+            busy_watts,
+        )
+    elif idle_watts is not None and busy_watts is not None:
+        logger.warning(
+            "calibração de energia descartada (ocioso %.2f W, sob carga %.2f W): a máquina não "
+            "estava parada o bastante — watts vão sair do modelo TDP",
+            idle_watts,
+            busy_watts,
+        )
 
 
 def _read_target_hashrate(env: dict[str, str]) -> float:
@@ -96,7 +153,6 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     suggest_difficulty = envfile.require_float(env, "SUGGEST_DIFFICULTY")
     reconnect_max_backoff = envfile.require_float(env, "RECONNECT_MAX_BACKOFF")
     cpu_tdp_watts = envfile.require_float(env, "CPU_TDP_WATTS")
-    power_strategy = envfile.require_choice(env, "POWER_STRATEGY", POWER_STRATEGY_CHOICES)
 
     running = threading.Event()
     running.set()
@@ -121,18 +177,16 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
                 "TARIFF_BRL_PER_KWH=%r inválida no .env, custo fica indisponível", tariff_raw
             )
 
-    if state.calibrated_max_hashrate is None:
-        logger.info("calibrando capacidade máxima da máquina (3s sem throttle)...")
-        max_hashrate = calibrate_max_hashrate()
-        state.set_calibrated_max_hashrate(max_hashrate)
-        logger.info("capacidade calibrada: %.0f H/s", max_hashrate)
+    idade = state.calibration_age_seconds
+    if (
+        state.calibrated_max_hashrate is None
+        or idade is None
+        or idade > CALIBRATION_MAX_AGE_SECONDS
+    ):
+        _calibrar(state)
     check_target_reachable(target_hashrate, state.calibrated_max_hashrate or target_hashrate)
 
-    power_meter = PowerMeter(tdp_watts=cpu_tdp_watts)
-    if power_strategy == "auto":
-        power_meter.calibrate_idle()  # só demora de verdade se o RAPL responder
-    else:
-        logger.info("POWER_STRATEGY=model: pulando calibração do RAPL, sempre Estratégia C")
+    power_meter = PowerMeter(tdp_watts=cpu_tdp_watts, joules_per_hash=state.joules_per_hash)
 
     client = StratumClient(pool_host, pool_port)
     job_box = _JobBox()
@@ -258,10 +312,11 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
             state.update_cpu_usage(cpu_fraction * 100)
         last_cpu_time, last_wall_time = now_cpu, now_wall
 
-        reading = power_meter.sample(cpu_fraction)
+        reading = power_meter.sample(cpu_fraction, state.hashrate_instant)
         kwh_delta = power_meter.kwh_total - last_kwh_total
         last_kwh_total = power_meter.kwh_total
-        state.update_power(reading.watts, power_meter.watts_avg, reading.strategy, kwh_delta)
+        state.set_watts_instant(reading.watts)
+        state.update_power(power_meter.watts_avg, reading.strategy, kwh_delta)
         if reading.strategy != last_power_strategy:
             logger.info("estratégia de energia: %s (%.2f W)", reading.strategy, reading.watts)
             last_power_strategy = reading.strategy

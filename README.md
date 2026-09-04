@@ -65,8 +65,16 @@ O hashrate é **limitado de propósito** por um throttle interno (mede o tempo g
 hashes e dorme o que sobrar), porque o objetivo aqui nunca foi competir por um bloco de verdade , 
 é entender o protocolo por dentro, gastando o mínimo de energia possível pra ilustrar o ponto.
 
-Além de minerar, o daemon mede consumo de energia real (via RAPL do processador, quando disponível,
-com um modelo estimado como alternativa) e expõe todo esse estado ,  hashrate, shares, dificuldade,
+Além de minerar, o daemon acompanha o consumo de energia. Quando o contador do processador
+(RAPL) é legível, ele calibra na inicialização **quanto custa um hash nesta máquina** ,  mede o
+consumo parado, mede durante alguns segundos de hash sem freio, e a diferença dividida pelo
+hashrate dá joules por hash. Daí em diante o painel mostra `MEDIDO` e converte hashrate em
+watts com um número medido no seu processador. Sem RAPL legível (permissão, CPU sem o
+contador, máquina virtual) sobra a estimativa `TDP × uso de CPU`, marcada `ESTIMADO` ,  serve
+pra ordem de grandeza e nada além: numa máquina de referência ela superestimou o consumo real
+em ~11× no ponto de operação de 350 KH/s. Ver `contrib/README.md` §3 pra liberar a leitura.
+
+O daemon expõe todo esse estado ,  hashrate, shares, dificuldade,
 watts, custo em reais ,  para um painel de terminal (`quixote top`) que roda como processo separado,
 lendo por um socket Unix local. Fechar o painel não interrompe a mineração.
 

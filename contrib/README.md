@@ -67,11 +67,11 @@ Variáveis:
 | Variável | Obrigatória | Padrão | Descrição |
 |---|---|---|---|
 | `BTC_ADDRESS` | sim |   | Seu endereço BTC. Usado como usuário no pool, no formato `endereco.desktop`. |
-| `TARGET_HASHRATE` | não | `350000` | Hashrate-alvo em H/s. Só muda com edição explícita do `.env` ,  não recarrega sozinho, precisa reiniciar o serviço (passo 5). |
+| `TARGET_HASHRATE` | não | `350000` | Hashrate-alvo em H/s. Só muda com edição explícita do `.env` ,  não recarrega sozinho, precisa reiniciar o serviço (passo 7). |
 | `TARIFF_BRL_PER_KWH` | não |   | Tarifa de energia, pro painel calcular custo em reais. Sem ela, custo fica indisponível. |
 
 As demais variáveis (`WORKER_NAME`, `BATCH_SIZE`, `POOL_HOST`, `POOL_PORT`, `SUGGEST_DIFFICULTY`,
-`RECONNECT_MAX_BACKOFF`, `CPU_TDP_WATTS`, `POWER_STRATEGY`, `REFRESH_HZ`, `SHOW_PROGRESS_JOKE`,
+`RECONNECT_MAX_BACKOFF`, `CPU_TDP_WATTS`, `REFRESH_HZ`, `SHOW_PROGRESS_JOKE`,
 `LOG_LEVEL`, `LOG_FILE`, `LOG_MAX_SIZE_MB`) são obrigatórias, mas o `.example.env` já vem com elas
 preenchidas ,  o passo acima (`cp .example.env .env`) já resolve todas, só `BTC_ADDRESS` precisa de
 edição pra sair do padrão. Sem alguma delas, o daemon/painel recusam subir com uma mensagem clara
@@ -79,13 +79,22 @@ dizendo qual falta, em vez de assumir um valor por conta própria.
 
 `.env` fica fora do versionamento (veja `.gitignore`) ,  nunca commite o seu.
 
-## 3. Leitura de energia real (RAPL, opcional)
+## 3. Leitura de energia real (RAPL, recomendado)
 
-Sem isso o daemon ainda funciona, só cai pra estratégia de watts estimados
-(`ESTIMADO` em vez de `RAPL`/`PROPORCIONAL` no log) ,  o kernel restringe
-`energy_uj` a root desde a mitigação da CVE-2020-8694. `contrib/99-rapl-read.rules`
-reabre a leitura pra qualquer usuário local; pense duas vezes antes de
-instalar em máquina compartilhada ou multiusuário.
+Sem isso o daemon funciona igual, só que os watts do painel passam a ser
+**estimados** em vez de medidos (`ESTIMADO` em vez de `MEDIDO` no log e no
+título do cartão ENERGIA). A diferença não é cosmética: a estimativa é
+`TDP × fração de CPU`, e numa máquina de referência ela superestimou o
+consumo real em ~11× no ponto de operação de 350 KH/s.
+
+Com a leitura liberada, o daemon calibra na inicialização quanta energia
+custa um hash nesta máquina (mede o consumo parado, mede durante 3s de hash
+sem freio, tira a diferença) e daí em diante converte hashrate em watts com
+um número medido no seu processador, não numa tabela de fabricante.
+
+O kernel restringe `energy_uj` a root desde a mitigação da CVE-2020-8694.
+`contrib/99-rapl-read.rules` reabre a leitura pra qualquer usuário local;
+pense duas vezes antes de instalar em máquina compartilhada ou multiusuário.
 
 ```
 sudo cp contrib/99-rapl-read.rules /etc/udev/rules.d/
@@ -94,7 +103,13 @@ sudo udevadm trigger --subsystem-match=powercap
 ```
 
 Teste: `cat /sys/class/powercap/intel-rapl:0/energy_uj` deve mostrar um
-número sem pedir senha.
+número sem pedir senha. Em CPU sem esse contador exposto (AMD sem o driver
+de energia carregado, máquina virtual, ARM) não há o que liberar — o daemon
+avisa no log e segue com a estimativa.
+
+A calibração é refeita sozinha quando passa de 3 dias. Pra forçar antes
+disso, apague `~/.local/share/quixote/state.json` (leva junto o recorde de
+dificuldade e o kWh acumulado) e reinicie o serviço.
 
 ## 4. Log em arquivo (opcional)
 

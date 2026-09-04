@@ -55,7 +55,7 @@ def test_require_bool_variacoes_aceitas(tmp_path):
 
 
 def test_require_choice_valido_e_invalido(tmp_path):
-    env = read_env(_write_env(tmp_path, "POWER_STRATEGY=model\nBAD=turbo\n"))
-    assert require_choice(env, "POWER_STRATEGY", ("auto", "model")) == "model"
+    env = read_env(_write_env(tmp_path, "MODO_TESTE=manual\nBAD=turbo\n"))
+    assert require_choice(env, "MODO_TESTE", ("auto", "manual")) == "manual"
     with pytest.raises(SystemExit):
-        require_choice(env, "BAD", ("auto", "model"))
+        require_choice(env, "BAD", ("auto", "manual"))

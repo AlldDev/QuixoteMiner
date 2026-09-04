@@ -100,8 +100,7 @@ def parse_coinbase_height(coinb1: str) -> int | None:
     `scriptSig` (varint) + `scriptSig` (começa com um push-opcode de 1
     byte seguido dos bytes da altura em little-endian, CScriptNum).
 
-    Nunca lança — retorna `None` para qualquer estrutura inesperada,
-    mesmo padrão de `telemetry.power.read_energy_uj`.
+    Nunca lança — retorna `None` para qualquer estrutura inesperada.
 
     Args:
         coinb1: primeira metade da coinbase, hex, como veio do pool.

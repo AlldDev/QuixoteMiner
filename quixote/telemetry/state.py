@@ -38,6 +38,11 @@ class _Persisted:
     best_difficulty_ever: float = 0.0
     best_difficulty_ever_timestamp: float | None = None
     calibrated_max_hashrate: float | None = None
+    joules_per_hash: float | None = None
+    calibrated_at: float | None = None
+    """`time.time()` da calibração. Um timestamp só para as duas medidas
+    acima: elas saem da mesma corrida sem throttle, envelhecem juntas (troca
+    de CPU, mudança de perfil de energia) e são refeitas juntas."""
     kwh_total: float = 0.0
     shares_accepted_total: int = 0
     shares_rejected_total: int = 0
@@ -125,9 +130,21 @@ class SharedState:
         with self._lock:
             self._blocks_found += 1
 
-    def set_calibrated_max_hashrate(self, value: float) -> None:
+    def set_calibration(self, max_hashrate: float, joules_per_hash: float | None) -> None:
+        """Grava o resultado da calibração de inicialização do daemon.
+
+        Args:
+            max_hashrate: capacidade máxima medida sem throttle.
+            joules_per_hash: custo energético por hash medido no RAPL na
+                mesma corrida, ou `None` se o RAPL não respondeu — nesse
+                caso o daemon cai na estratégia estimada, e gravar `None`
+                garante que a próxima execução não reaproveite um valor
+                calibrado noutra máquina/kernel.
+        """
         with self._lock:
-            self._persisted.calibrated_max_hashrate = value
+            self._persisted.calibrated_max_hashrate = max_hashrate
+            self._persisted.joules_per_hash = joules_per_hash
+            self._persisted.calibrated_at = time.time()
             self._save_persisted()
 
     def update_cpu_usage(self, percent: float) -> None:
@@ -158,20 +175,35 @@ class SharedState:
         with self._lock:
             self._target_hashrate = value
 
-    def update_power(self, watts: float, watts_avg: float, strategy: str, kwh_delta: float) -> None:
-        """Registra uma amostra de `telemetry.power.PowerMeter`.
+    def set_watts_instant(self, watts: float) -> None:
+        """Potência do último segundo, escrita pelo loop de monitor do
+        `daemon.py` a cada `MONITOR_INTERVAL_SECONDS`.
+
+        `watts` vem de `telemetry.power.PowerMeter.sample`: na estratégia
+        `MEDIDO` é `hashrate_instantaneo * joules_por_hash` calibrado no
+        RAPL; na `ESTIMADO`, `TDP * fração de CPU`. Nenhuma das duas é uma
+        leitura de estado binário ligado/desligado, então nenhuma sofre o
+        alias de fase com o ciclo de lote do hasher que derrubou a versão
+        anterior deste campo (histórico de 2026-09-03).
+        """
+        with self._lock:
+            self._watts_instant = watts
+
+    def update_power(self, watts_avg: float, strategy: str, kwh_delta: float) -> None:
+        """Registra uma amostra de `telemetry.power.PowerMeter` (média/kWh).
+
+        A potência instantânea **não** vem daqui — ver `set_watts_instant`.
 
         Args:
-            watts: potência instantânea da amostra.
             watts_avg: `PowerMeter.watts_avg` (média da sessão).
-            strategy: `"RAPL"`, `"PROPORCIONAL"` ou `"ESTIMADO"`.
+            strategy: sempre `"ESTIMADO"` — `telemetry.power` só tem a
+                estratégia de modelo TDP, ver seu docstring de módulo.
             kwh_delta: kWh consumidos desde a última amostra — soma tanto
                 na sessão quanto no total persistido. Salvo em disco a cada
                 amostra (mesma regra do `best_difficulty`), não só ao sair,
                 pra não perder consumo acumulado num crash.
         """
         with self._lock:
-            self._watts_instant = watts
             self._watts_avg = watts_avg
             self._power_strategy = strategy
             self._kwh_session += kwh_delta
@@ -227,6 +259,30 @@ class SharedState:
     def calibrated_max_hashrate(self) -> float | None:
         with self._lock:
             return self._persisted.calibrated_max_hashrate
+
+    @property
+    def joules_per_hash(self) -> float | None:
+        with self._lock:
+            return self._persisted.joules_per_hash
+
+    @property
+    def calibration_age_seconds(self) -> float | None:
+        """Idade da calibração persistida, ou `None` se nunca calibrou.
+
+        Estado gravado antes deste campo existir também devolve `None`: sem
+        timestamp não dá pra afirmar que é recente, e o daemon recalibra.
+        """
+        with self._lock:
+            if self._persisted.calibrated_at is None:
+                return None
+            return time.time() - self._persisted.calibrated_at
+
+    @property
+    def hashrate_instant(self) -> float:
+        """Hashrate do último lote. O loop de monitor lê isto a 1 Hz pra
+        converter em watts — barato, não monta o snapshot inteiro."""
+        with self._lock:
+            return self._hashrate_instant
 
     def to_dict(self) -> dict[str, Any]:
         """Snapshot serializável do estado, usado pelo servidor IPC."""

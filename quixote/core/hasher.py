@@ -6,11 +6,13 @@ resultado (montar um `Share` e submeter, por exemplo).
 
 O laço quente (hashear cada nonce) roda em Rust (`quixote_native`,
 `rust/quixote_native/`) — única implementação, não um caminho alternativo
-opcional. Decisão de 2026-09-02: nesta máquina (Zen 1,
-sem SHA-NI) o laço Python completo sustentava ~800 KH/s a ~46% de um
-núcleo pros 350 KH/s travados pela invariante 9; o mesmo em Rust sustenta
-~6,5 MH/s, o que baixa o custo de CPU pra sustentar 350 KH/s pra ~5% de um
-núcleo. Consequência aceita: `quixote_native` precisa estar compilado
+opcional. Decisão de 2026-09-02: na máquina de referência, o laço Python
+completo sustentava ~800 KH/s e gastava ~46% de um núcleo pros 350 KH/s
+travados pela invariante 9; o mesmo em Rust sustenta ~6,5 MH/s (medido de
+novo em 2026-09-03: 6.550.746 H/s), o que baixa o custo pra ~11% de um
+núcleo. Os números absolutos valem só pra essa máquina — o que vale em
+qualquer uma é a razão, e por isso `calibrate_max_hashrate` mede em vez de
+assumir. Consequência aceita: `quixote_native` precisa estar compilado
 (`maturin develop --release` dentro de `rust/quixote_native/`) pra este
 módulo sequer importar — ver `contrib/README.md`.
 """

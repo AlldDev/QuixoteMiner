@@ -80,9 +80,8 @@ def _setup_logging(log_level_name: str, env: dict[str, str], is_daemon: bool) ->
         file_handler.setFormatter(logging.Formatter(fmt))
     except OSError as exc:
         # LOG_FILE em /var/log/ exige o diretório já criado com o dono certo
-        # (contrib/README.md documenta o `sudo install -d` — mesma categoria
-        # da regra udev do RAPL: passo manual, uma vez só, degrada gracioso
-        # se não tiver sido feito ainda).
+        # (contrib/README.md documenta o `sudo install -d`) — passo manual,
+        # uma vez só, degrada gracioso se não tiver sido feito ainda.
         logger.warning("não foi possível abrir LOG_FILE=%s (%s) — sem log em arquivo", path, exc)
         return
 

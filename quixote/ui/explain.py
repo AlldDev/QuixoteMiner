@@ -58,7 +58,9 @@ def montar_explicacao_job(
     for indice, branch in enumerate(job.merkle_branch, start=1):
         node = sha256d(node + branch)
         linhas.append(f"  passo {indice}: sha256d(node + ramo {branch.hex()}) = {node.hex()}")
-    linhas.append(f"merkle root final (invertido, formato de explorador): {merkle_root[::-1].hex()}")
+    linhas.append(
+        f"merkle root final (invertido, formato de explorador): {merkle_root[::-1].hex()}"
+    )
 
     linhas.append("\n--- HEADER (80 bytes: offset, campo, bytes, valor) ---")
     header = serialize_header(
@@ -92,7 +94,9 @@ def montar_explicacao_job(
     linhas.append("\n--- CÁLCULO DO THROTTLE ---")
     linhas.append(f"hashrate-alvo: {target_hashrate:,.0f} H/s")
     linhas.append(f"tamanho do lote: {batch_size} hashes")
-    linhas.append(f"tempo esperado por lote: {batch_size / target_hashrate:.4f}s (dorme o restante)")
+    linhas.append(
+        f"tempo esperado por lote: {batch_size / target_hashrate:.4f}s (dorme o restante)"
+    )
     if calibrated_max_hashrate:
         percentual = target_hashrate / calibrated_max_hashrate * 100
         linhas.append(f"capacidade calibrada desta máquina: {calibrated_max_hashrate:,.0f} H/s")

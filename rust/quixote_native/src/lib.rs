@@ -41,6 +41,7 @@ fn less_than_le(a: &[u8; 32], b: &[u8]) -> bool {
 /// lógica aqui).
 #[pyfunction]
 fn search_nonces(
+    py: Python<'_>,
     header_prefix: &[u8],
     start_nonce: u32,
     count: u32,
@@ -58,18 +59,25 @@ fn search_nonces(
         ));
     }
 
-    let mut buffer = [0u8; 80];
-    buffer[..76].copy_from_slice(header_prefix);
+    // Solta o GIL durante o laço quente: só mexe em bytes/buffer local, não
+    // em objeto Python nenhum, então outras threads (Stratum, IPC) podem
+    // rodar de verdade enquanto este lote hasheia, em vez de ficarem
+    // congeladas esperando o GIL voltar a cada lote.
+    let found = py.detach(|| {
+        let mut buffer = [0u8; 80];
+        buffer[..76].copy_from_slice(header_prefix);
 
-    let mut found = Vec::new();
-    for offset in 0..count {
-        let nonce = start_nonce.wrapping_add(offset);
-        buffer[76..80].copy_from_slice(&nonce.to_le_bytes());
-        let hash = sha256d(&buffer);
-        if less_than_le(&hash, target_pool) || less_than_le(&hash, target_rede) {
-            found.push((nonce, hash.to_vec()));
+        let mut found = Vec::new();
+        for offset in 0..count {
+            let nonce = start_nonce.wrapping_add(offset);
+            buffer[76..80].copy_from_slice(&nonce.to_le_bytes());
+            let hash = sha256d(&buffer);
+            if less_than_le(&hash, target_pool) || less_than_le(&hash, target_rede) {
+                found.push((nonce, hash.to_vec()));
+            }
         }
-    }
+        found
+    });
     Ok(found)
 }
 
