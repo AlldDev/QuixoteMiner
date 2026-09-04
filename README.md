@@ -108,14 +108,35 @@ existe se um desses hashes também bater o alvo da rede.
 
 **Quem valida um bloco não é o Quixote.** O daemon nunca monta o bloco completo ,  o job do Stratum
 (`mining.notify`) só traz `coinb1`/`coinb2` e o `merkle_branch` (o galho da árvore, não a lista de
-transações inteira). Quando um hash passa no alvo da rede, `quixote/core/hasher.py` só loga
-`BLOCO ENCONTRADO!` como telemetria local ,  isso é uma afirmação do cliente, não uma prova. A
+transações inteira). Quando um hash passa no alvo da rede, `quixote/core/hasher.py` loga
+`BLOCO ENCONTRADO!` e grava um arquivo em `~/.local/share/quixote/blocks/` com tudo que remonta os
+80 bytes do cabeçalho (job, `extranonce1`/`extranonce2`, nonce, coinbase montada) ,  isso é uma
+afirmação do cliente, não uma prova, mas é o que permite remontar e submeter o bloco à mão se o
+envio falhar no instante exato. A
 submissão (`mining.submit`) vai pro pool, e é o nó Bitcoin completo por trás dele que confere o
 hash de verdade, monta o bloco inteiro (cabeçalho + coinbase real + as transações que ele escolheu)
 e propaga pra rede, onde cada nó completo valida as regras de consenso de novo. Por isso o teste que
 importa (veja [Testes](#testes)) exige o `{"result": true}` vindo do pool: é a única confirmação
 externa de que algo bateu em algum alvo válido ,  nenhum log local, por mais alto o nível, prova
 sozinho.
+
+**O pool escolhe quem recebe.** No Stratum v1 não existe campo de endereço: o `coinb2` que o pool
+manda já contém o `scriptPubKey` da saída que recebe o subsídio, e o `BTC_ADDRESS` do `.env` viaja
+só como nome de usuário no `mining.authorize`. Um minerador solo que não decodifica essa coinbase
+não tem como saber se está trabalhando para si mesmo. Por isso o daemon decodifica o endereço
+configurado (bech32/bech32m/base58check, com checksum e rede conferidos ,  endereço inválido é
+`SystemExit` na partida) e, a cada job, soma quanto a coinbase paga àquele script. Se não pagar ,
+ou se a coinbase não puder ser percorrida ,  **a mineração para**, com `CRITICAL` no log e
+`recompensa destino NÃO CONFERE` no painel. É a defesa contra pool comprometido ou MITM no TCP em
+claro; contra endereço digitado errado não protege, porque o pool passa a pagar no endereço errado
+junto.
+
+O painel mostra **destino, não valor**: `recompensa destino CONFERIDO · a coinbase deste job paga
+seu endereço`. O número em BTC fica de fora de propósito ,  ele é o subsídio + as taxas do template
+daquele job, que o pool remonta a cada `mining.notify`, e não um saldo: sem bloco encontrado não
+existe recompensa nenhuma. Quem quiser ver o número e as saídas da coinbase lado a lado usa
+`--explain`, que imprime a seção `DESTINO DA RECOMPENSA` marcando qual saída é a sua e dizendo, em
+texto, que nada daquilo foi pago.
 
 ---
 

@@ -15,7 +15,11 @@ from quixote.core.merkle import (
     compute_merkle_root,
     next_extranonce2,
 )
+from quixote.core.payout import coinbase_outputs
 from quixote.core.target import difficulty_to_target, nbits_to_target, target_to_difficulty
+
+WITNESS_COMMITMENT_PREFIX = bytes.fromhex("6a24aa21a9ed")
+"""`OP_RETURN` + push de 36 bytes + a tag `aa21a9ed` do BIP141."""
 
 
 def montar_explicacao_job(
@@ -26,6 +30,7 @@ def montar_explicacao_job(
     target_hashrate: float,
     batch_size: int,
     calibrated_max_hashrate: float | None,
+    script_pubkey_esperado: bytes,
 ) -> str:
     """Monta a explicação completa do header pra este job, campo a campo.
 
@@ -60,6 +65,36 @@ def montar_explicacao_job(
         linhas.append(f"  passo {indice}: sha256d(node + ramo {branch.hex()}) = {node.hex()}")
     linhas.append(
         f"merkle root final (invertido, formato de explorador): {merkle_root[::-1].hex()}"
+    )
+
+    linhas.append("\n--- DESTINO DA RECOMPENSA ---")
+    linhas.append(f"seu scriptPubKey (derivado do BTC_ADDRESS): {script_pubkey_esperado.hex()}")
+    saidas = coinbase_outputs(coinbase)
+    if saidas is None:
+        linhas.append("as saídas desta coinbase não puderam ser percorridas — mineração parada")
+    else:
+        linhas.append("saídas da coinbase deste job:")
+        for indice, (valor, script) in enumerate(saidas):
+            if script == script_pubkey_esperado:
+                rotulo = "<- SEU ENDEREÇO"
+            elif script.startswith(WITNESS_COMMITMENT_PREFIX):
+                # OP_RETURN + push de 36 bytes + tag do BIP141: é o compromisso
+                # com a merkle root das witnesses, obrigatório desde o segwit e
+                # sempre de valor zero
+                rotulo = "compromisso de witness (BIP141)"
+            else:
+                rotulo = ""
+            # rótulo antes do hex: o script de saída varia de 44 a 76 caracteres
+            # (P2WPKH contra compromisso de witness), então deixar o hex por
+            # último é o que mantém as colunas alinhadas. Separador de milhar
+            # em vírgula, como o resto deste módulo (número plano, não o pt-BR
+            # do painel).
+            linhas.append(f"  [{indice}] {valor:>15,} sats  {rotulo:<31} {script.hex()}")
+        total = sum(valor for valor, script in saidas if script == script_pubkey_esperado)
+        linhas.append(f"soma paga a você: {total / 1e8:.8f} BTC — subsídio + taxas deste template")
+    linhas.append(
+        "nada disso foi pago: o valor só existe se um hash deste job bater o target\n"
+        "  da rede, e o pool remonta o template (com outras taxas) a cada job novo."
     )
 
     linhas.append("\n--- HEADER (80 bytes: offset, campo, bytes, valor) ---")
@@ -114,6 +149,7 @@ def explicar_job(
     target_hashrate: float,
     batch_size: int,
     calibrated_max_hashrate: float | None,
+    script_pubkey_esperado: bytes,
 ) -> None:
     """Imprime a explicação de `montar_explicacao_job` no stdout."""
     print(
@@ -125,6 +161,7 @@ def explicar_job(
             target_hashrate,
             batch_size,
             calibrated_max_hashrate,
+            script_pubkey_esperado,
         )
     )
     # stdout fica bufferizado em bloco quando não é um TTY (systemd/journald,

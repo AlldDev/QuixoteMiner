@@ -292,3 +292,59 @@ def test_share_rejeitada_registra_motivo_sem_derrubar_conexao():
 
     client.close()
     thread.join(timeout=2)
+
+
+def test_submit_sem_conexao_devolve_false_em_vez_de_levantar():
+    """`submit` é chamado da thread do hasher, que não é reiniciada por
+    ninguém: uma exceção subindo dali parava a mineração em definitivo com o
+    processo vivo. `close()` durante a reconexão zera o arquivo, e é
+    exatamente a janela em que uma solução pode aparecer."""
+    client = StratumClient("127.0.0.1", 1)
+    share = Share(worker="w", job_id="job1", extranonce2=b"\x00" * 4, ntime=1, nonce=2)
+
+    assert client.submit(share) is False
+
+
+def test_só_conta_share_de_submit_que_este_cliente_fez():
+    """`accepted_count` é a prova da invariante 1. Antes, qualquer resposta
+    com `result: true` e sem `method` entrava na contagem — inclusive a de um
+    `mining.suggest_difficulty`, que ninguém consome."""
+    client = StratumClient("127.0.0.1", 1)
+
+    client.handle_message({"id": 3, "error": None, "result": True})
+    assert client.accepted_count == 0
+
+    client._pending_submits[7] = "job1"
+    client.handle_message({"id": 7, "error": None, "result": True})
+    assert client.accepted_count == 1
+
+    # e a rejeição registra o job, não o id JSON-RPC
+    client._pending_submits[8] = "job2"
+    client.handle_message({"id": 8, "error": [23, "Low difficulty share", None], "result": False})
+    assert client.rejected_shares[-1][0] == "job2"
+
+
+def test_subscribe_incrementa_o_epoch_da_sessao():
+    """Uma reconexão troca o extranonce1; quem estiver minerando com o antigo
+    produz coinbase inválida e precisa parar. O epoch é o sinal."""
+
+    def handler(server_sock: socket.socket) -> None:
+        for _ in range(2):
+            conn, _addr = server_sock.accept()
+            with conn, conn.makefile("rw", encoding="utf-8", newline="\n") as f:
+                f.readline()
+                f.write(json.dumps(SUBSCRIBE_OK) + "\n")
+                f.flush()
+
+    _thread, server_sock, port = _start_mock_server(handler)
+    with server_sock:
+        client = StratumClient("127.0.0.1", port)
+        assert client.session_epoch == 0
+        client.connect()
+        client.subscribe()
+        assert client.session_epoch == 1
+        client.close()
+        client.connect()
+        client.subscribe()
+        assert client.session_epoch == 2
+        client.close()

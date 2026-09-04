@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -68,13 +69,15 @@ COR_RESULTADOS = "#9ece6a"
 COR_SISTEMA = "#e0af68"
 COR_EXPLICAR = "#f7768e"  # cartão de destaque do atalho `e`, toma a tela toda enquanto ativo
 COR_LABEL = "#565f89"  # rótulo de todo campo label/valor, sempre este tom — só o valor muda de cor
-COR_EXTRANONCE2 = "#7dcfff"  # único valor com cor própria no mockup, mantido aqui
+COR_NONCE = "#7dcfff"  # único valor com cor própria no mockup; era do extranonce2, passou pro nonce
+COR_DESTINO_OK = "#9ece6a"
+COR_DESTINO_ERRADO = "#f7768e"
 
 SPARKLINE_NIVEIS = "▁▂▃▄▅▆▇█"
 
-ALTURA_CARTAO_PADRAO = 5  # 3 linhas de conteúdo + 2 de borda (ENERGIA/RESULTADOS/TRABALHO)
-ALTURA_COLUNA_DIREITA = ALTURA_CARTAO_PADRAO * 2  # linha de cima + TRABALHO embaixo
-# ponytail: número fixo, calculado a partir da estrutura atual dos 3 cartões da
+ALTURA_CARTAO_PADRAO = 5  # 3 linhas de conteúdo + 2 de borda (SESSÃO/HISTÓRICO/ENERGIA/TRABALHO)
+ALTURA_COLUNA_DIREITA = ALTURA_CARTAO_PADRAO * 2  # duas linhas de dois cartões
+# ponytail: número fixo, calculado a partir da estrutura atual dos 4 cartões da
 # direita — se algum ganhar/perder linha de conteúdo, atualizar junto. Medir a
 # altura renderizada de verdade (duas passadas) resolveria isso sozinho, mas é
 # esforço maior do que o problema pede agora.
@@ -149,6 +152,19 @@ def progresso_bloco_percent(hashes_total: int, network_difficulty: float) -> flo
     return hashes_total / esperado * 100
 
 
+def nonce_espaco_percent(nonce: int) -> float:
+    """% do espaço de nonce já varrido no job atual.
+
+    Cada `extranonce2` tem `2**32` nonces possíveis, e `core.hasher.mine_job`
+    percorre esse espaço em ordem. A 350 KH/s um espaço inteiro levaria ~3,4h
+    — na prática o job novo chega muito antes e a varredura recomeça do zero,
+    então esse número quase nunca passa de alguns por cento. É essa a graça
+    de mostrá-lo: deixa ver o tamanho do espaço de busca contra o quanto dele
+    dá tempo de olhar.
+    """
+    return nonce / 2**32 * 100
+
+
 def capacidade_percent(hashrate_avg: float, calibrated_max_hashrate: float | None) -> float | None:
     """% da capacidade máxima calibrada da máquina em uso, ou `None` sem calibração."""
     if not calibrated_max_hashrate:
@@ -183,6 +199,27 @@ def _moeda_brl(valor: float | None) -> str:
     return "—" if valor is None else f"R$ {format_numero_ptbr(valor, 2)}"
 
 
+def _linha_larga(markup: str) -> Text:
+    """Uma linha de campo fora do grid, pra valor que não cabe numa célula.
+
+    As colunas de `_grid_campos` são compartilhadas por todas as linhas da
+    tabela, então um valor longo (uma data completa, o motivo de rejeição que
+    o pool mandou) estica a coluna dele e esprememe os rótulos das outras
+    linhas — "aceitas" virando "acei…" mesmo sobrando espaço no cartão. Fora
+    da tabela, o valor longo só trunca a si mesmo. `no_wrap` mantém uma linha
+    só, que é o que segura a altura fixa dos cartões
+    (`ALTURA_CARTAO_PADRAO`).
+
+    Só serve pra valor de tamanho imprevisível. Quando dá pra fixar a largura
+    do valor na origem (o nonce em hexadecimal, por exemplo), fixar é melhor:
+    aí ele cabe no grid e fica alinhado com o resto do cartão.
+    """
+    texto = Text.from_markup(markup)
+    texto.no_wrap = True
+    texto.overflow = "ellipsis"
+    return texto
+
+
 def _grid_campos(*linhas: tuple[tuple[str, str], ...]) -> Table:
     """Tabela de campos label/valor — todas as linhas na MESMA tabela.
 
@@ -213,24 +250,45 @@ def _grid_campos(*linhas: tuple[tuple[str, str], ...]) -> Table:
 
 
 def _secao_hashrate(s: dict[str, Any]) -> Panel:
-    """Cartão de destaque do painel (mockup 1b) — inclui o sparkline de histórico."""
+    """Cartão de destaque do painel: número grande, sparkline e campos alinhados.
+
+    As duas primeiras linhas não são campos rótulo/valor de propósito — são o
+    ponto do cartão de destaque: o hashrate instantâneo em corpo grande e o
+    histórico recente. O resto sai de `_grid_campos`, igual aos outros cinco
+    cartões, com **um par por linha** porque o cartão ocupa só 1/3 da largura.
+
+    A versão anterior concatenava os campos dentro de strings
+    (`"média sessão X    capacidade máx Y (Z%)"`), e isso quebrava de duas
+    formas: rótulo caindo em coluna diferente conforme a largura do valor
+    vizinho, e quebra de linha de verdade em qualquer terminal abaixo de ~200
+    colunas — dentro de um cartão de altura travada, a linha que quebra come a
+    de baixo. O percentual de capacidade também aparecia solto entre
+    parênteses, sem rótulo dizendo o que era; virou o campo `uso`.
+
+    São exatamente 8 linhas de conteúdo (número, sparkline, branco, 4 campos,
+    barra), que é `ALTURA_COLUNA_DIREITA` menos as duas de borda. Acrescentar
+    campo aqui exige revisar aquela constante.
+    """
     alvo = s.get("target_hashrate")
-    instant = scale_si(s["hashrate_instant"], "H/s")
-    media = scale_si(s["hashrate_avg"], "H/s")
     capacidade = s.get("calibrated_max_hashrate")
     cap_percent = capacidade_percent(s["hashrate_avg"], capacidade)
-    linha1 = f"[bold {COR_HASHRATE}]{instant}[/bold {COR_HASHRATE}]"
-    if alvo:
-        linha1 += f"    [{COR_LABEL}]alvo[/{COR_LABEL}] {scale_si(alvo, 'H/s')}"
+    uso = "—" if cap_percent is None else format_numero_ptbr(cap_percent, 1) + "%"
+    grid = _grid_campos(
+        (("alvo", scale_si(alvo, "H/s") if alvo else "—"),),
+        (("média sessão", scale_si(s["hashrate_avg"], "H/s")),),
+        (("capacidade máx", scale_si(capacidade, "H/s") if capacidade else "não calibrada"),),
+        (("uso", uso),),
+    )
     spark = _sparkline(s["hashrate_history"])
-    linha_spark = spark if spark else "[dim]aguardando histórico...[/dim]"
-    linha3 = f"[{COR_LABEL}]média sessão[/{COR_LABEL}] {media}"
-    if capacidade:
-        linha3 += (
-            f"    [{COR_LABEL}]capacidade máx[/{COR_LABEL}] {scale_si(capacidade, 'H/s')}"
-            f" ({format_numero_ptbr(cap_percent or 0.0, 1)}%)"
-        )
-    corpo = Group(linha1, linha_spark, linha3)
+    corpo = Group(
+        f"[bold {COR_HASHRATE}]{scale_si(s['hashrate_instant'], 'H/s')}[/bold {COR_HASHRATE}]",
+        spark if spark else "[dim]aguardando histórico...[/dim]",
+        "",
+        grid,
+        # barra de 20 e não BARRA_LARGURA (28): o cartão tem ~30 colunas úteis
+        # num terminal de 100 colunas, e a de 28 encostaria na borda
+        _linha_larga(_barra((cap_percent or 0.0) / 100, 20)),
+    )
     return Panel(corpo, title="HASHRATE", border_style=COR_HASHRATE, height=ALTURA_COLUNA_DIREITA)
 
 
@@ -253,11 +311,26 @@ def _secao_energia(s: dict[str, Any]) -> Panel:
 
 
 def _secao_trabalho(s: dict[str, Any]) -> Panel:
+    """Onde a busca está agora: job, alvos e a posição no espaço de nonce.
+
+    O campo do nonce ficava no `extranonce2`, que é zero permanente por
+    construção — `mine_job` só o incrementa quando esgota os 2**32 nonces de
+    um espaço, e a 350 KH/s o job novo sempre chega antes (~3,4h).
+
+    O nonce sai em hexadecimal de 8 dígitos, e não em decimal com separador
+    de milhar, por causa da largura: em decimal ele cresce de 5 pra 13
+    caracteres conforme a varredura avança, e como as colunas do grid são
+    compartilhadas por todas as linhas do cartão, o layout inteiro se
+    reajustava a cada quadro. 8 dígitos são 8 dígitos do começo ao fim do
+    espaço. De quebra é a forma como o nonce existe de verdade: 4 bytes do
+    header, que é como qualquer explorador de blocos mostra.
+
+    O `ntime` saiu daqui quando o cartão perdeu a largura total: os seis
+    campos não cabem alinhados em ~38 colunas. Ele continua no `--explain`,
+    que imprime o header campo a campo.
+    """
     altura = s.get("current_block_height")
-    extranonce2 = s.get("current_extranonce2")
-    valor_extranonce2 = (
-        f"[{COR_EXTRANONCE2}]{extranonce2}[/{COR_EXTRANONCE2}]" if extranonce2 else "—"
-    )
+    nonce = s.get("current_nonce") or 0
     grid = _grid_campos(
         (
             ("job", s["current_job_id"] or "—"),
@@ -267,59 +340,175 @@ def _secao_trabalho(s: dict[str, Any]) -> Panel:
             ("dif pool", scale_si(s["pool_difficulty"])),
             ("dif rede", scale_si(s["network_difficulty"])),
         ),
-        (("extranonce2", valor_extranonce2), ("ntime", str(s.get("current_ntime") or "—"))),
+        (
+            ("nonce", f"[{COR_NONCE}]{nonce:08x}[/{COR_NONCE}]"),
+            ("espaço", format_numero_ptbr(nonce_espaco_percent(nonce), 2) + "%"),
+        ),
     )
     titulo = f"[{COR_TRABALHO}]TRABALHO[/{COR_TRABALHO}]"
     return Panel(grid, title=titulo, border_style=COR_BORDA_NEUTRA)
 
 
-def _secao_resultados(s: dict[str, Any]) -> Panel:
-    """Cartão de resultados (mockup 1b) — "última share" mora aqui, não no rodapé.
+def _secao_sessao(s: dict[str, Any]) -> Panel:
+    """Resultados desde que este processo do daemon subiu.
 
     Sempre 3 linhas de conteúdo (motivo de rejeição embutido na célula
-    "rejeitadas", não numa linha própria) — mesma altura de ENERGIA/TRABALHO,
-    pro cartão HASHRATE poder casar a altura com a coluna inteira à direita
+    "rejeitadas", não numa linha própria) — mesma altura dos outros três
+    cartões da direita, pro HASHRATE poder casar com a coluna inteira
     (ver `ALTURA_COLUNA_DIREITA`).
     """
-    agora = time.time()
-    rejeitadas = str(s["shares_rejected"])
-    if s.get("last_rejection_reason"):
-        rejeitadas += f" [dim]({s['last_rejection_reason']})[/dim]"
     grid = _grid_campos(
-        (("aceitas", str(s["shares_accepted"])), ("rejeitadas", rejeitadas)),
+        (("aceitas", str(s["shares_accepted"])), ("rejeitadas", str(s["shares_rejected"]))),
         (
-            ("melhor sessão", format_numero_ptbr(s["best_difficulty_session"], 4)),
-            ("melhor sempre", format_numero_ptbr(s["best_difficulty_ever"], 4)),
-        ),
-        (
+            ("melhor", format_numero_ptbr(s["best_difficulty_session"], 4)),
             ("blocos", str(s["blocks_found"])),
-            ("última share", format_tempo_relativo(s.get("last_share_timestamp"), agora)),
         ),
     )
-    titulo = f"[{COR_RESULTADOS}]RESULTADOS[/{COR_RESULTADOS}]"
-    return Panel(grid, title=titulo, border_style=COR_BORDA_NEUTRA)
+    # O motivo da última rejeição vem junto do último evento, não colado no
+    # contador: é texto do pool, de tamanho imprevisível, e dentro do grid
+    # esticava a coluna e truncava os rótulos vizinhos.
+    motivo = s.get("last_rejection_reason")
+    ultima = _linha_larga(
+        f"[{COR_LABEL}]última share[/{COR_LABEL}] "
+        f"{format_tempo_relativo(s.get('last_share_timestamp'), time.time())}"
+        + (f"  [dim]({motivo})[/dim]" if motivo else "")
+    )
+    titulo = f"[{COR_RESULTADOS}]SESSÃO[/{COR_RESULTADOS}]"
+    return Panel(Group(grid, ultima), title=titulo, border_style=COR_BORDA_NEUTRA)
+
+
+def _secao_historico(s: dict[str, Any]) -> Panel:
+    """Resultados acumulados de todas as execuções (o que sobrevive em `state.json`).
+
+    Existe porque os totais persistidos já viajavam no snapshot e não
+    apareciam em lugar nenhum do painel: quem reiniciava o serviço via o
+    trabalho de semanas virar zero na tela, mesmo estando gravado em disco.
+    """
+    grid = _grid_campos(
+        (
+            ("aceitas", str(s.get("shares_accepted_total", 0))),
+            ("rejeitadas", str(s.get("shares_rejected_total", 0))),
+        ),
+        (
+            ("melhor", format_numero_ptbr(s["best_difficulty_ever"], 4)),
+            ("blocos", str(s.get("blocks_found_total", 0))),
+        ),
+    )
+    recorde = _linha_larga(
+        f"[{COR_LABEL}]recorde em[/{COR_LABEL}] "
+        f"{format_timestamp_ptbr(s.get('best_difficulty_ever_timestamp'))}"
+    )
+    titulo = f"[{COR_RESULTADOS}]HISTÓRICO[/{COR_RESULTADOS}]"
+    return Panel(Group(grid, recorde), title=titulo, border_style=COR_BORDA_NEUTRA)
+
+
+def formatar_destino_recompensa(coinbase_pays_us_satoshis: int | None, tem_job: bool) -> str:
+    """Monta a linha de conferência do destino da recompensa.
+
+    No Stratum v1 quem escolhe o destino é o pool: o `coinb2` já traz o
+    `scriptPubKey` da saída que recebe o subsídio, e o `BTC_ADDRESS` viaja só
+    como nome de usuário no `mining.authorize`. O daemon decodifica o endereço
+    configurado e confere, a cada job, se a coinbase paga àquele script
+    (`core.payout`) — sem mostrar isso na tela, um desvio de destino seria
+    invisível.
+
+    **A linha não mostra valor em BTC, de propósito.** A versão anterior
+    imprimia `pagamento CONFERIDO 3,15439929 BTC no seu endereço` e foi lida
+    como dinheiro recebido, que é exatamente o que não aconteceu: sem bloco
+    encontrado não existe recompensa nenhuma, e aquele número era o subsídio
+    + taxas do template do job atual, remontado pelo pool a cada
+    `mining.notify` (visto variando 3,142 / 3,154 / 3,161 BTC em minutos).
+    O valor vive no log da conferência e no `--explain`, onde há espaço pra
+    dizer o que ele é. Não recolocar aqui.
+
+    O veredito vem antes da explicação porque a linha sai na coluna de valor de
+    `_grid_campos`, que é `no_wrap` + ellipsis: truncando em terminal estreito,
+    perde-se o final, nunca o `CONFERIDO`/`NÃO CONFERE`. O rótulo
+    ("recompensa") não vem daqui — é a primeira coluna do grid, como em todo
+    campo do painel.
+
+    Args:
+        coinbase_pays_us_satoshis: campo homônimo do snapshot — total que a
+            coinbase do job atual paga ao endereço configurado, `0` se não
+            paga nada e `None` se a coinbase não pôde ser percorrida (ou se
+            nenhum job chegou ainda).
+        tem_job: se já existe job atual — distingue "ainda não sei" de
+            "coinbase ilegível".
+
+    Returns:
+        Markup do Rich, já colorido.
+    """
+    if coinbase_pays_us_satoshis is None and not tem_job:
+        return "destino ainda não conferido, aguardando o primeiro job"
+    if coinbase_pays_us_satoshis is None:
+        return (
+            f"destino [{COR_DESTINO_ERRADO}]DESCONHECIDO[/{COR_DESTINO_ERRADO}]"
+            " · coinbase deste job ilegível, mineração parada"
+        )
+    if coinbase_pays_us_satoshis == 0:
+        return (
+            f"destino [{COR_DESTINO_ERRADO}]NÃO CONFERE[/{COR_DESTINO_ERRADO}]"
+            " · coinbase deste job paga outro endereço, mineração parada"
+        )
+    return (
+        f"destino [{COR_DESTINO_OK}]CONFERIDO[/{COR_DESTINO_OK}]"
+        " · a coinbase deste job paga seu endereço"
+    )
 
 
 def _secao_sistema(s: dict[str, Any], mostrar_progresso: bool) -> Panel:
-    """Cartão de largura total: progresso até o bloco, uptime e uso de CPU."""
-    grid = _grid_campos(
+    """Cartão de largura total: destino da recompensa, progresso, uptime e CPU.
+
+    Um `_grid_campos` só, um par por linha — a mesma gramática dos outros
+    cartões. Antes eram três formas empilhadas (uma `_linha_larga`, uma
+    f-string com a barra e o rótulo no meio, um grid de três pares numa linha)
+    e nenhum rótulo alinhava com o de cima.
+
+    Um par por linha resolve o problema que motivou `_linha_larga` sem precisar
+    dela: a coluna do valor é a última do grid, então o texto longo da
+    recompensa só estica a si mesmo, e `_grid_campos` já põe `no_wrap` +
+    `ellipsis` nessa coluna — que é a propriedade de que
+    `formatar_destino_recompensa` depende pra sobreviver ao truncamento.
+
+    A conferência de destino mora aqui, e não no cartão TRABALHO, por dois
+    motivos: os quatro cartões da direita têm altura fixa de 3 linhas de
+    conteúdo (`ALTURA_CARTAO_PADRAO`), e o texto pode ficar longo — este
+    cartão é o único de largura total e de altura variável.
+    """
+    linhas: list[tuple[tuple[str, str], ...]] = [
         (
-            ("uptime", format_uptime(s["uptime_seconds"])),
-            ("cpu (núcleo)", format_numero_ptbr(s["cpu_usage_percent"], 1) + "%"),
-            ("cpu (máquina)", format_numero_ptbr(s["cpu_usage_percent_maquina"], 1) + "%"),
-        ),
-    )
-    itens: list[RenderableType] = []
+            (
+                "recompensa",
+                formatar_destino_recompensa(
+                    s.get("coinbase_pays_us_satoshis"), bool(s.get("current_job_id"))
+                ),
+            ),
+        )
+    ]
     if mostrar_progresso:
         progresso = progresso_bloco_percent(s["hashes_total"], s["network_difficulty"])
-        itens.append(f"{_barra(progresso / 100)} progresso até o bloco: {progresso:.2e}%")
-    itens.append(grid)
+        # a notação científica tem um ponto decimal só (o `e-16` não é ponto),
+        # então o replace basta pra deixar o número em pt-BR como o resto do painel
+        percent_ptbr = f"{progresso:.2e}".replace(".", ",")
+        linhas.append((("progresso", f"{_barra(progresso / 100)}  {percent_ptbr}% até o bloco"),))
+    linhas.append((("uptime", format_uptime(s["uptime_seconds"])),))
+    linhas.append((("cpu (núcleo)", format_numero_ptbr(s["cpu_usage_percent"], 1) + "%"),))
+    linhas.append((("cpu (máquina)", format_numero_ptbr(s["cpu_usage_percent_maquina"], 1) + "%"),))
     titulo = f"[{COR_SISTEMA}]SISTEMA[/{COR_SISTEMA}]"
-    return Panel(Group(*itens), title=titulo, border_style=COR_BORDA_NEUTRA)
+    return Panel(_grid_campos(*linhas), title=titulo, border_style=COR_BORDA_NEUTRA)
 
 
 def _formatar_atalho(tecla: str, acao: str) -> str:
     return f"[bold black on {COR_SISTEMA}] {tecla.upper()} [/bold black on {COR_SISTEMA}] {acao}"
+
+
+def _linha_de_dois(esquerda: Panel, direita: Panel) -> Table:
+    """Dois cartões dividindo a largura meio a meio."""
+    linha = Table.grid(expand=True)
+    linha.add_column(ratio=1)
+    linha.add_column(ratio=1)
+    linha.add_row(esquerda, direita)
+    return linha
 
 
 def render(snapshot: dict[str, Any] | None, mostrar_progresso: bool = True) -> Panel:
@@ -346,16 +535,15 @@ def render(snapshot: dict[str, Any] | None, mostrar_progresso: bool = True) -> P
     conexao = s.get("connection_state", "desconectado")
     cor_conexao = CORES_CONEXAO.get(conexao, "white")
 
-    # Grid 1b: HASHRATE em destaque à esquerda; ENERGIA + RESULTADOS lado a
-    # lado à direita, com TRABALHO embaixo ocupando a largura toda. ENERGIA/
-    # RESULTADOS em `Table.grid` (não `Columns`) pra dividir a linha meio a
-    # meio de verdade — `Columns` dimensiona pelo conteúdo e deixava sobrar
-    # um vão vazio à direita em vez de esticar os dois painéis.
-    linha_energia_resultados = Table.grid(expand=True)
-    linha_energia_resultados.add_column(ratio=1)
-    linha_energia_resultados.add_column(ratio=1)
-    linha_energia_resultados.add_row(_secao_energia(s), _secao_resultados(s))
-    coluna_direita = Group(linha_energia_resultados, _secao_trabalho(s))
+    # Grid 1b: HASHRATE em destaque à esquerda, altura das duas linhas; à
+    # direita, dois cartões por linha — SESSÃO + HISTÓRICO em cima, ENERGIA +
+    # TRABALHO embaixo. `Table.grid` (não `Columns`) pra dividir cada linha
+    # meio a meio de verdade — `Columns` dimensiona pelo conteúdo e deixava
+    # sobrar um vão vazio à direita em vez de esticar os dois painéis.
+    coluna_direita = Group(
+        _linha_de_dois(_secao_sessao(s), _secao_historico(s)),
+        _linha_de_dois(_secao_energia(s), _secao_trabalho(s)),
+    )
     grade = Table.grid(expand=True)
     grade.add_column(ratio=1)
     grade.add_column(ratio=2)
@@ -432,7 +620,20 @@ def _esperar_tecla_ou_intervalo(interativo: bool, timeout: float) -> str | None:
         time.sleep(timeout)
         return None
     prontos, _, _ = select.select([sys.stdin], [], [], timeout)
-    return sys.stdin.read(1) if prontos else None
+    return _ler_byte() if prontos else None
+
+
+def _ler_byte() -> str:
+    """Lê um byte direto do descritor, sem passar pelo buffer do `sys.stdin`.
+
+    `sys.stdin.read(1)` é um `TextIOWrapper`: ele puxa do fd tudo que estiver
+    disponível (uma seta chega como os 3 bytes `ESC [ A` de uma vez) e guarda
+    o resto num buffer interno em Python. O `select` seguinte olha o fd, que
+    já está vazio, e conclui que não veio nada — a sequência de escape ficava
+    invisível e a seta era lida como um `ESC` solto. `os.read` no fd mantém
+    `select` e leitura falando do mesmo lugar.
+    """
+    return os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
 
 
 ESCAPE_PARA_TOKEN = {"A": "up", "B": "down", "5": "pgup", "6": "pgdn"}
@@ -450,18 +651,18 @@ def _ler_tecla_navegacao() -> str:
     decodificar as setas também resolve a rolagem por mouse "de graça".
     Qualquer outra tecla volta como veio, pro chamador decidir (ex.: sair).
     """
-    tecla = sys.stdin.read(1)
+    tecla = _ler_byte()
     if tecla != "\x1b":
         return tecla
     prontos, _, _ = select.select([sys.stdin], [], [], 0.05)
     if not prontos:
         return tecla  # ESC sozinho, sem sequência vindo atrás
-    if sys.stdin.read(1) != "[":
+    if _ler_byte() != "[":
         return tecla
-    codigo = sys.stdin.read(1)
+    codigo = _ler_byte()
     if codigo in "56":
         select.select([sys.stdin], [], [], 0.05)
-        sys.stdin.read(1)  # descarta o '~' final de ESC[5~/ESC[6~
+        _ler_byte()  # descarta o '~' final de ESC[5~/ESC[6~
     return ESCAPE_PARA_TOKEN.get(codigo, tecla)
 
 
@@ -494,8 +695,47 @@ def _abrir_logs(live: Live, log_file: str | None) -> None:
         live.start(refresh=True)
 
 
-LINHAS_RESERVADAS_EXPLICACAO = 4
-"""2 linhas de borda do Panel + linha em branco + rodapé de ajuda/paginação."""
+LINHAS_RESERVADAS_EXPLICACAO = 2
+"""As 2 linhas de borda do Panel — o rodapé mora *na* borda de baixo, não no corpo."""
+
+
+def _quebrar_para_largura(linhas: list[str], largura: int) -> list[str]:
+    """Quebra cada linha em pedaços de no máximo `largura` colunas, virando linhas próprias.
+
+    Sem isso, uma linha longa (o `coinb1` inteiro em hex, por exemplo) é
+    quebrada pelo Rich *dentro* do cartão: o Panel fica mais alto que a tela,
+    e o que sobra pra fora é justo a borda de baixo, com o rodapé. Quebrando
+    aqui, cada pedaço conta como uma linha rolável — nada se perde e a altura
+    do cartão continua exata.
+    """
+    return [
+        pedaco
+        for linha in linhas
+        for pedaco in (textwrap.wrap(linha, largura, drop_whitespace=False) or [""])
+    ]
+
+
+def _painel_explicacao(linhas: list[str], offset: int, altura_visivel: int) -> Panel:
+    """Monta o cartão da explicação com a janela de `altura_visivel` linhas a partir de `offset`.
+
+    O rodapé de ajuda/paginação vai no `subtitle`, que o Rich desenha *sobre*
+    a borda de baixo, do mesmo jeito que o título fica sobre a de cima. No
+    corpo, ele subia junto com o conteúdo e sumia de vista; na borda, só o
+    conteúdo se mexe. `offset` já vem limitado pelo chamador.
+    """
+    janela = linhas[offset : offset + altura_visivel]
+    ajuda = "↑/↓ ou roda do mouse rola · PgUp/PgDn pula página · outra tecla volta"
+    # Posição primeiro: o Rich corta o `subtitle` pela largura do cartão, e
+    # em terminal estreito é a ajuda que pode ir embora, não onde você está.
+    rodape = ajuda
+    if len(linhas) > altura_visivel:
+        rodape = f"[{offset + 1}-{offset + len(janela)}/{len(linhas)}]    {ajuda}"
+    return Panel(
+        Text("\n".join(janela), no_wrap=True, overflow="crop"),
+        title=f"[{COR_EXPLICAR}]EXPLICAR JOB[/{COR_EXPLICAR}]",
+        subtitle=rodape,
+        border_style=COR_EXPLICAR,
+    )
 
 
 def _mostrar_explicacao(live: Live, snapshot: dict[str, Any] | None) -> None:
@@ -511,20 +751,16 @@ def _mostrar_explicacao(live: Live, snapshot: dict[str, Any] | None) -> None:
     """
     explicacao = snapshot.get("current_job_explanation") if snapshot else None
     linhas = (explicacao or "aguardando o primeiro job pra explicar...").split("\n")
-    titulo = f"[{COR_EXPLICAR}]EXPLICAR JOB[/{COR_EXPLICAR}]"
 
     offset = 0
     while True:
         altura_visivel = max(1, live.console.size.height - LINHAS_RESERVADAS_EXPLICACAO)
-        offset_max = max(0, len(linhas) - altura_visivel)
+        # 2 de borda + 2 de padding do Panel; recalculado a cada quadro porque
+        # o terminal pode ser redimensionado com a explicação aberta.
+        roladas = _quebrar_para_largura(linhas, max(20, live.console.size.width - 4))
+        offset_max = max(0, len(roladas) - altura_visivel)
         offset = min(offset, offset_max)
-        janela = linhas[offset : offset + altura_visivel]
-
-        rodape = "↑/↓ ou roda do mouse rola · PgUp/PgDn pula página · outra tecla volta"
-        if offset_max > 0:
-            rodape += f"    [{offset + 1}-{offset + len(janela)}/{len(linhas)}]"
-        corpo = Text("\n".join(janela) + "\n\n" + rodape)
-        live.update(Panel(corpo, title=titulo, border_style=COR_EXPLICAR))
+        live.update(_painel_explicacao(roladas, offset, altura_visivel))
 
         tecla = _ler_tecla_navegacao()
         if tecla == "up":

@@ -121,26 +121,24 @@ def test_should_continue_falso_de_cara_nao_acha_nada():
     assert found == []
 
 
-def test_on_extranonce2_change_chamado_a_cada_iteracao_do_laco_externo():
-    """Cobertura extra: extranonce2 atual reportado, primeiro incluso."""
+def test_on_batch_reporta_o_nonce_inicial_de_cada_lote():
+    """É por aqui que o painel sabe onde a varredura está no espaço de nonce."""
     job = _job()
-    vistos: list[bytes] = []
+    lotes: list[tuple[int, int]] = []
 
     mine_job(
         job,
         EXTRANONCE1,
         EXTRANONCE2_SIZE,
-        target_pool=0,  # nunca satisfeito, força esgotar o espaço de nonce e avançar
+        target_pool=0,  # nunca satisfeito, o laço só varre
         on_share=lambda extranonce2, nonce: None,
-        should_continue=_stop_after(3),  # deixa passar por 2 extranonce2 completos
-        max_nonces=5,
-        on_extranonce2_change=vistos.append,
+        should_continue=_stop_after(3),
+        max_nonces=30,
+        batch_size=10,
+        on_batch=lambda hashes, _elapsed, start_nonce: lotes.append((hashes, start_nonce)),
     )
 
-    assert vistos == [
-        next_extranonce2(0, EXTRANONCE2_SIZE),
-        next_extranonce2(1, EXTRANONCE2_SIZE),
-    ]
+    assert lotes == [(10, 0), (10, 10)]
 
 
 def test_trace_loga_prefixo_do_header(caplog):
@@ -199,7 +197,56 @@ def test_chama_on_block_found_quando_passa_no_target_da_rede():
         on_share=lambda extranonce2, nonce: None,
         should_continue=_stop_after(2),
         max_nonces=1,
-        on_block_found=lambda: chamadas.__setitem__("n", chamadas["n"] + 1),
+        on_block_found=lambda candidato: chamadas.__setitem__("n", chamadas["n"] + 1),
     )
 
     assert chamadas["n"] == 1
+
+
+def test_on_block_found_recebe_o_candidato_que_remonta_o_header():
+    """O que o callback entrega tem que bastar para reconstruir o bloco.
+
+    A submissão pode falhar (socket caindo no instante do envio) e o pool é a
+    única testemunha do bloco. O teste remonta os 80 bytes a partir só dos
+    campos do candidato, hasheia, e exige o mesmo hash que o candidato
+    declara — se algum campo estiver faltando ou trocado de ordem, isso
+    quebra aqui em vez de quebrar no dia.
+    """
+    job = _job(nbits=NBITS_QUALQUER_HASH_SATISFAZ)
+    candidatos = []
+
+    mine_job(
+        job,
+        EXTRANONCE1,
+        EXTRANONCE2_SIZE,
+        target_pool=2**256 - 1,
+        on_share=lambda extranonce2, nonce: None,
+        should_continue=_stop_after(2),
+        max_nonces=1,
+        on_block_found=candidatos.append,
+    )
+
+    assert len(candidatos) == 1
+    candidato = candidatos[0]
+
+    coinbase = build_coinbase(
+        candidato.coinb1, candidato.extranonce1, candidato.extranonce2, candidato.coinb2
+    )
+    merkle_root = compute_merkle_root(
+        coinbase_txid(coinbase), [bytes.fromhex(b) for b in candidato.merkle_branch]
+    )
+    header = (
+        struct.pack("<I", candidato.version)
+        + bytes.fromhex(candidato.prev_hash)
+        + merkle_root
+        + struct.pack("<I", candidato.ntime)
+        + struct.pack("<I", candidato.nbits)
+        + struct.pack("<I", candidato.nonce)
+    )
+
+    assert header.hex() == candidato.header
+    assert merkle_root.hex() == candidato.merkle_root
+    assert coinbase.hex() == candidato.coinbase
+    assert sha256d(header)[::-1].hex() == candidato.block_hash_display
+    assert candidato.job_id == job.job_id
+    assert candidato.found_at > 0

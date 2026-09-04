@@ -108,8 +108,11 @@ de energia carregado, máquina virtual, ARM) não há o que liberar — o daemon
 avisa no log e segue com a estimativa.
 
 A calibração é refeita sozinha quando passa de 3 dias. Pra forçar antes
-disso, apague `~/.local/share/quixote/state.json` (leva junto o recorde de
-dificuldade e o kWh acumulado) e reinicie o serviço.
+disso, apague `~/.local/share/quixote/state.json` e reinicie o serviço —
+mas saiba o que vai embora junto: o recorde de dificuldade, o kWh acumulado,
+os totais de shares e o **contador de blocos encontrados**. Os arquivos de
+`~/.local/share/quixote/blocks/` (um por bloco encontrado, com o header
+completo) não são afetados.
 
 ## 4. Log em arquivo (opcional)
 

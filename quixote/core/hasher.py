@@ -24,8 +24,8 @@ from collections.abc import Callable
 
 import quixote_native
 
-from quixote.core.hashing import hash_to_int
-from quixote.core.job import Job
+from quixote.core.hashing import hash_to_int, sha256d
+from quixote.core.job import BlockCandidate, Job
 from quixote.core.merkle import build_coinbase, coinbase_txid, compute_merkle_root, next_extranonce2
 from quixote.core.target import nbits_to_target, share_difficulty
 
@@ -63,10 +63,9 @@ def mine_job(
     batch_size: int = DEFAULT_BATCH_SIZE,
     target_hashrate: float | None = None,
     sleep_func: Callable[[float], None] = time.sleep,
-    on_batch: Callable[[int, float], None] | None = None,
+    on_batch: Callable[[int, float, int], None] | None = None,
     on_share_difficulty: Callable[[float], None] | None = None,
-    on_extranonce2_change: Callable[[bytes], None] | None = None,
-    on_block_found: Callable[[], None] | None = None,
+    on_block_found: Callable[[BlockCandidate], None] | None = None,
 ) -> None:
     """Procura um nonce que satisfaça o target da pool para este job.
 
@@ -95,22 +94,21 @@ def mine_job(
         target_hashrate: hashrate alvo em H/s. `None` (padrão) desliga o
             throttle por completo — o hasher roda no máximo que conseguir.
         sleep_func: injetável para teste, mesmo padrão de `StratumClient`.
-        on_batch: chamado a cada lote com `(hashes_no_lote, segundos)`,
-            pra quem quiser medir hashrate real ou uso de CPU.
+        on_batch: chamado a cada lote com `(hashes_no_lote, segundos,
+            nonce_inicial_do_lote)`, pra quem quiser medir hashrate real ou
+            mostrar onde a varredura está no espaço de nonce. É o único
+            ponto do laço onde o nonce em andamento fica visível de fora.
         on_share_difficulty: chamado com a dificuldade da share (mesmo
             valor do log "share encontrada"), sempre junto de `on_share` —
             evita recalcular o hash de novo só pra saber a dificuldade.
-        on_extranonce2_change: chamado com o `extranonce2` (bytes) toda
-            vez que o laço externo entra numa iteração nova — inclui a
-            primeira, então quem só quer "o extranonce2 atual" (painel)
-            recebe o valor logo de cara, sem esperar um estouro de espaço
-            de nonce (que na prática quase nunca acontece).
-        on_block_found: chamado sem argumentos sempre que um hash passa no
-            target da rede (bloco de verdade, não só share de pool) — junto
-            do log CRITICAL "BLOCO ENCONTRADO". Quem monta e propaga o
-            bloco completo pra rede é o pool (o hash já satisfaz o target
-            da pool também, então `on_share` dispara do mesmo jeito); este
-            callback é só pra telemetria local não ficar cega a esse caso.
+        on_block_found: chamado com o `BlockCandidate` completo sempre que
+            um hash passa no target da rede (bloco de verdade, não só share
+            de pool) — junto do log CRITICAL "BLOCO ENCONTRADO", e **antes**
+            de `on_share` submeter, pra que o registro em disco exista mesmo
+            que a submissão exploda. Quem monta e propaga o bloco completo
+            pra rede é o pool (o hash já satisfaz o target da pool também,
+            então `on_share` dispara do mesmo jeito); o candidato é gravado
+            porque a submissão pode falhar e o pool é a única testemunha.
     """
     target_rede = nbits_to_target(job.nbits)
     target_rede_bytes = target_rede.to_bytes(32, "little")
@@ -119,8 +117,6 @@ def mine_job(
 
     while should_continue():
         extranonce2 = next_extranonce2(extranonce2_counter, extranonce2_size)
-        if on_extranonce2_change is not None:
-            on_extranonce2_change(extranonce2)
         coinbase = build_coinbase(job.coinb1, extranonce1, extranonce2.hex(), job.coinb2)
         merkle_root = compute_merkle_root(coinbase_txid(coinbase), job.merkle_branch)
         header_prefix = _header_prefix(job, merkle_root)
@@ -144,14 +140,38 @@ def mine_job(
                 header_hash = bytes(header_hash_bytes)
                 value = hash_to_int(header_hash)
                 if value < target_rede:
+                    header = header_prefix + struct.pack("<I", nonce)
+                    candidato = BlockCandidate(
+                        found_at=time.time(),
+                        job_id=job.job_id,
+                        version=job.version,
+                        prev_hash=job.prev_hash.hex(),
+                        coinb1=job.coinb1,
+                        coinb2=job.coinb2,
+                        merkle_branch=[branch.hex() for branch in job.merkle_branch],
+                        nbits=job.nbits,
+                        ntime=job.ntime,
+                        extranonce1=extranonce1,
+                        extranonce2=extranonce2.hex(),
+                        nonce=nonce,
+                        coinbase=coinbase.hex(),
+                        merkle_root=merkle_root.hex(),
+                        header=header.hex(),
+                        # o hash de exibição é o reverso do interno; recalcular
+                        # a partir do header remontado (em vez de reusar
+                        # `header_hash`) confirma que os 80 bytes gravados são
+                        # de fato os que produziram o acerto
+                        block_hash_display=sha256d(header)[::-1].hex(),
+                    )
                     logger.critical(
-                        "BLOCO ENCONTRADO! job=%s extranonce2=%s nonce=%s",
+                        "BLOCO ENCONTRADO! job=%s extranonce2=%s nonce=%s hash=%s",
                         job.job_id,
                         extranonce2.hex(),
                         nonce,
+                        candidato.block_hash_display,
                     )
                     if on_block_found is not None:
-                        on_block_found()
+                        on_block_found(candidato)
                 if value < target_pool:
                     difficulty = share_difficulty(header_hash)
                     logger.info("share encontrada: job=%s dificuldade=%.4f", job.job_id, difficulty)
@@ -165,7 +185,7 @@ def mine_job(
                     sleep_func(due - elapsed)
                     elapsed = due
             if on_batch is not None:
-                on_batch(count, elapsed)
+                on_batch(count, elapsed, start_nonce)
 
         extranonce2_counter += 1
 

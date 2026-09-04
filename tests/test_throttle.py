@@ -31,7 +31,7 @@ def _mine_por_segundos(target_hashrate: float | None, segundos: float) -> tuple[
     inicio = time.monotonic()
     deadline = inicio + segundos
 
-    def _on_batch(hashes_no_lote: int, _elapsed: float) -> None:
+    def _on_batch(hashes_no_lote: int, _elapsed: float, _start_nonce: int) -> None:
         total["hashes"] += hashes_no_lote
 
     mine_job(

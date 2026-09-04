@@ -25,9 +25,9 @@ NOTIFY_TIMEOUT_SECONDS = 10 * 60
 class StratumClient:
     """Cliente síncrono e bloqueante do protocolo Stratum v1.
 
-    Concorrência (rodar isso numa thread própria enquanto o hasher roda em
-    outra) é responsabilidade de `daemon.py`, que ainda não existe — esta
-    classe só sabe falar com um pool, uma conexão de cada vez.
+    Concorrência é responsabilidade de `daemon.py`, que roda `run_forever`
+    numa thread e chama `submit` de outra — esta classe só sabe falar com um
+    pool, uma conexão de cada vez.
     """
 
     def __init__(
@@ -51,6 +51,17 @@ class StratumClient:
         self.current_job: Job | None = None
         self.accepted_count = 0
         self.rejected_shares: list[tuple[str, str]] = []
+        self.session_epoch = 0
+        """Incrementado a cada `subscribe`. Quem estiver minerando precisa
+        parar quando isso muda: o `extranonce1` da sessão nova é outro, e a
+        coinbase montada com o antigo não confere mais — uma share (ou um
+        bloco) enviada depois de uma reconexão com o extranonce velho é
+        inválida para o pool."""
+        self._pending_submits: dict[int, str] = {}
+        """id JSON-RPC → `job_id` das submissões ainda sem resposta. Sem esse
+        mapa, `handle_message` contaria como share aceita qualquer resposta
+        com `result: true` (a do `mining.suggest_difficulty`, por exemplo) e
+        registraria o id no lugar do job em `rejected_shares`."""
         self.connection_state: str = "desconectado"
         """Espelha as transições já logadas, pra SharedState ter de onde ler
         sem duplicar lógica: desconectado, conectando, conectado, reconectando."""
@@ -72,13 +83,21 @@ class StratumClient:
             self._sock.close()
         self._file = None
         self._sock = None
+        # os ids pendentes eram desta sessão; a resposta nunca vai chegar e
+        # deixá-los no mapa só acumularia lixo (e o job_id já não valeria mais)
+        self._pending_submits.clear()
 
     def _send(self, method: str, params: list[Any]) -> int:
         msg_id = self._next_id
         self._next_id += 1
         line = json.dumps({"id": msg_id, "method": method, "params": params})
         logger.debug("-> %s", line)
-        assert self._file is not None
+        if self._file is None:
+            # acontece de verdade: `close()` zera o arquivo durante a janela de
+            # reconexão, e `submit` é chamado da thread do hasher, que não sabe
+            # nada disso. ConnectionError (e não AssertionError) porque é uma
+            # falha de rede esperada, tratável por quem chamou.
+            raise ConnectionError("sem conexão com o pool")
         self._file.write(line + "\n")
         self._file.flush()
         return msg_id
@@ -96,7 +115,8 @@ class StratumClient:
         Raises:
             ConnectionError: se o pool fechou a conexão (linha vazia).
         """
-        assert self._file is not None
+        if self._file is None:
+            raise ConnectionError("sem conexão com o pool")
         line = self._file.readline()
         if line == "":
             raise ConnectionError("conexão fechada pelo pool")
@@ -114,6 +134,7 @@ class StratumClient:
         result = response["result"]
         self.extranonce1 = result[1]
         self.extranonce2_size = result[2]
+        self.session_epoch += 1
         logger.info(
             "subscribed: extranonce1=%s extranonce2_size=%s",
             self.extranonce1,
@@ -142,22 +163,49 @@ class StratumClient:
         elif method == "mining.set_difficulty":
             self.pool_difficulty = message["params"][0]
             logger.info("nova dificuldade da pool: %s", self.pool_difficulty)
-        elif "result" in message:
-            # só sobra resposta de mining.submit aqui: subscribe/authorize já
-            # são consumidos pelos próprios métodos antes do loop de eventos.
+        elif "result" in message and message.get("id") in self._pending_submits:
+            # só resposta de submissão que este cliente fez de fato, casada
+            # pelo id JSON-RPC. Sem o casamento, a resposta de um
+            # `mining.suggest_difficulty` (que ninguém consome) entraria aqui
+            # e inflaria `accepted_count`, que é a prova da invariante 1.
             # Confirmado contra o public-pool.io real: rejeição pode vir com
             # "result": false OU "result": null (não só bool).
+            job_id = self._pending_submits.pop(message["id"])
             if message["result"] is True:
                 self.accepted_count += 1
-                logger.info("share aceita (total %s)", self.accepted_count)
+                # com o job no meio, esta linha sozinha vale como a prova
+                # externa da invariante 1: é a resposta a um `mining.submit`
+                # que este cliente fez, casada pelo id, e sai em INFO (o
+                # `<- {"result":true}` cru só existe em DEBUG)
+                logger.info("share do job %s aceita (total %s)", job_id, self.accepted_count)
             else:
                 reason = str(message.get("error"))
-                self.rejected_shares.append((str(message.get("id")), reason))
-                logger.warning("share rejeitada: %s", reason)
+                self.rejected_shares.append((job_id, reason))
+                logger.warning("share do job %s rejeitada: %s", job_id, reason)
 
-    def submit(self, share: Share) -> None:
-        """Envia `mining.submit`. A resposta chega depois, no loop de leitura."""
-        self._send("mining.submit", share.to_submit_params())
+    def submit(self, share: Share) -> bool:
+        """Envia `mining.submit`. A resposta chega depois, no loop de leitura.
+
+        Nunca levanta por falha de rede: é chamada da thread do hasher, e uma
+        exceção subindo dali mataria a mineração em definitivo (a thread não
+        é reiniciada por ninguém). Quem chama decide o que fazer com o
+        `False` — em share, é só uma share perdida; em bloco, é o evento que
+        justifica o registro em disco de `SharedState.record_block_found`.
+
+        Args:
+            share: a solução a submeter.
+
+        Returns:
+            `True` se a linha foi escrita no socket. Isso não é aceitação: o
+            veredito do pool chega depois, em `handle_message`.
+        """
+        try:
+            msg_id = self._send("mining.submit", share.to_submit_params())
+        except OSError as exc:
+            logger.error("falha ao enviar mining.submit do job %s: %s", share.job_id, exc)
+            return False
+        self._pending_submits[msg_id] = share.job_id
+        return True
 
     def run_forever(
         self,
@@ -199,7 +247,14 @@ class StratumClient:
                         and self.current_job is not None
                     ):
                         on_job(self.current_job)
-            except OSError as exc:
+            except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+                # não só OSError: um JSON quebrado (`JSONDecodeError`, que é
+                # `ValueError`) ou um `mining.notify` malformado
+                # (`KeyError`/`ValueError`/`TypeError` em `Job.from_notify`,
+                # `IndexError` em `set_difficulty` sem params) encerravam esta
+                # thread em silêncio, e o daemon seguia mostrando "conectado"
+                # sem nunca receber outro job. Reconectar é a resposta certa
+                # pros dois casos.
                 self.connection_state = "reconectando"
                 logger.warning("conexão perdida (%s), reconectando em %.0fs", exc, backoff)
                 self.close()
@@ -213,7 +268,17 @@ class StratumClient:
 if __name__ == "__main__":
     import pathlib
 
+    from quixote.core.payout import address_to_script_pubkey
     from quixote.envfile import read_env
+
+    SCRIPT_PUBKEY_PLACEHOLDER = "0014751e76e8199196d454941c45d1b3a323f1433bd6"
+    """Vetor de exemplo do BIP173, usado no lugar do `scriptPubKey` real.
+
+    A fixture é versionada, e o `coinb2` que o pool manda carrega o
+    `scriptPubKey` do endereço configurado — ou seja, uma captura crua
+    colocaria o endereço real do usuário no repositório (invariante 9 do
+    CLAUDE.md). A troca é textual e preserva o comprimento, então a fixture
+    continua parseável campo a campo."""
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -227,9 +292,12 @@ if __name__ == "__main__":
     fixture_path = repo_root / "tests" / "fixtures" / "public-pool-session.jsonl"
     start_time = time.monotonic()
 
+    script_pubkey_real = address_to_script_pubkey(address).hex()
+
     def _grava_e_imprime(msg: dict[str, Any]) -> None:
+        linha = json.dumps({"t": round(time.monotonic() - start_time, 3), "raw": msg})
         with fixture_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"t": round(time.monotonic() - start_time, 3), "raw": msg}) + "\n")
+            f.write(linha.replace(script_pubkey_real, SCRIPT_PUBKEY_PLACEHOLDER) + "\n")
 
     fixture_path.write_text("")  # começa um arquivo novo a cada captura
     client = StratumClient("public-pool.io", 21496)

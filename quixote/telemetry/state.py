@@ -2,8 +2,8 @@
 
 Carrega tudo que o throttle, o cliente Stratum e a telemetria de energia
 alimentam de verdade — hashrate (instantâneo e um histórico curto pro
-sparkline do painel), job atual (incluindo altura do bloco, ntime e
-extranonce2), shares, watts/kWh/custo e uso de CPU — pra alimentar
+sparkline do painel), job atual (incluindo altura do bloco, ntime e o nonce
+em varredura), shares, watts/kWh/custo e uso de CPU — pra alimentar
 o painel (`quixote top`) sem que ele precise conhecer nenhuma dessas
 threads diretamente.
 """
@@ -18,10 +18,20 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from quixote.core.job import BlockCandidate
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_PATH = pathlib.Path.home() / ".local" / "share" / "quixote" / "state.json"
-"""Onde `best_difficulty_ever` e `calibrated_max_hashrate` persistem entre execuções."""
+"""Onde os campos de `_Persisted` sobrevivem entre execuções."""
+
+BLOCKS_DIRNAME = "blocks"
+"""Subdiretório, ao lado do `state.json`, com um arquivo por bloco encontrado.
+
+Separado do `state.json` de propósito: aquele é reescrito a cada segundo
+(`update_power`) e um arquivo por candidato nunca é sobrescrito nem
+rotacionado, então nem uma corrupção do estado nem a rotação do log levam
+embora o único registro reconstruível do bloco."""
 
 HISTORY_MAXLEN = 20
 HISTORY_SAMPLE_INTERVAL_SECONDS = 5.0
@@ -46,6 +56,7 @@ class _Persisted:
     kwh_total: float = 0.0
     shares_accepted_total: int = 0
     shares_rejected_total: int = 0
+    blocks_found_total: int = 0
 
 
 class SharedState:
@@ -68,7 +79,7 @@ class SharedState:
         self._current_job_id: str | None = None
         self._current_block_height: int | None = None
         self._current_ntime: int | None = None
-        self._current_extranonce2: str | None = None
+        self._current_nonce = 0
         self._current_job_explanation: str | None = None
         self._pool_difficulty = 0.0
         self._network_difficulty = 0.0
@@ -88,8 +99,20 @@ class SharedState:
         self._kwh_session = 0.0
         self._tariff_brl_per_kwh: float | None = None
         self._target_hashrate: float | None = None
+        self._coinbase_pays_us_satoshis: int | None = None
+        """Quanto a coinbase do job atual paga ao endereço configurado.
 
-    # --- persistência (só best_difficulty_ever e calibrated_max_hashrate) ---
+        Não é saldo nem recebimento: é o subsídio + taxas do template deste
+        job, que o pool remonta a cada `mining.notify`. Só vira dinheiro se um
+        hash deste job bater o target da rede. O nome carrega isso de
+        propósito — a versão anterior se chamava `payout` e o painel imprimia
+        o valor como se tivesse sido pago.
+
+        `None` enquanto nenhum job foi conferido, ou quando a coinbase não pôde
+        ser percorrida — os dois casos param a mineração, e o painel precisa
+        distinguir "não confere" de "ainda não sei"."""
+
+    # --- persistência (campos de _Persisted + um arquivo por bloco encontrado) ---
 
     def _load_persisted(self) -> _Persisted:
         if not self._persistence_path.exists():
@@ -104,15 +127,39 @@ class SharedState:
             return _Persisted()
 
     def _save_persisted(self) -> None:
+        """Grava o estado persistido de forma atômica.
+
+        `update_power` chama isto uma vez por segundo, para sempre — são ~86
+        mil reescritas por dia. Com `write_text` direto, uma queda de energia
+        no meio de qualquer uma delas deixaria o JSON truncado, e
+        `_load_persisted` descarta arquivo inválido em silêncio: iria embora o
+        `blocks_found_total`. Escrever num temporário e renomear torna a troca
+        atômica no mesmo sistema de arquivos.
+        """
         self._persistence_path.parent.mkdir(parents=True, exist_ok=True)
-        self._persistence_path.write_text(json.dumps(asdict(self._persisted)))
+        temporario = self._persistence_path.with_suffix(".json.tmp")
+        temporario.write_text(json.dumps(asdict(self._persisted)))
+        os.replace(temporario, self._persistence_path)
 
     # --- atualizações vindas do throttle (core.hasher) ---
 
-    def update_hashrate(self, hashrate_instant: float, hashes_no_lote: int) -> None:
+    def update_hashrate(
+        self, hashrate_instant: float, hashes_no_lote: int, nonce_atual: int = 0
+    ) -> None:
+        """Registra um lote de hash concluído.
+
+        Args:
+            hashrate_instant: hashes por segundo medidos neste lote.
+            hashes_no_lote: quantos nonces o lote cobriu, somado ao total.
+            nonce_atual: nonce inicial do lote (`on_batch` de
+                `core.hasher.mine_job`). Não acumula: é uma posição no
+                espaço de 2**32 do job atual, e volta a zero sozinho quando
+                um job novo reinicia a varredura.
+        """
         with self._lock:
             self._hashrate_instant = hashrate_instant
             self._hashes_total += hashes_no_lote
+            self._current_nonce = nonce_atual
             agora = time.monotonic()
             if agora - self._hashrate_history_last_sample >= HISTORY_SAMPLE_INTERVAL_SECONDS:
                 self._hashrate_history.append(hashrate_instant)
@@ -126,9 +173,43 @@ class SharedState:
                 self._persisted.best_difficulty_ever_timestamp = time.time()
                 self._save_persisted()
 
-    def record_block_found(self) -> None:
+    def record_block_found(self, candidato: BlockCandidate) -> None:
+        """Um hash passou no target da rede: grava o candidato antes de tudo.
+
+        Chamado por `core.hasher.mine_job` **antes** da submissão, porque a
+        submissão é a parte que pode falhar. O arquivo de candidato é o único
+        registro do qual o header de 80 bytes pode ser remontado — o log fica
+        em `LOG_LEVEL=INFO` sem os campos do `mining.notify` e ainda rotaciona.
+
+        Args:
+            candidato: o bloco encontrado, com todos os campos do header.
+        """
         with self._lock:
             self._blocks_found += 1
+            self._persisted.blocks_found_total += 1
+            self._save_persisted()
+            self._save_block_candidate(candidato)
+
+    def _save_block_candidate(self, candidato: BlockCandidate) -> None:
+        """Escreve um arquivo novo por candidato, sem nunca sobrescrever.
+
+        Falha de escrita aqui não pode derrubar a thread do hasher nem impedir
+        a submissão que vem em seguida — se o disco estiver cheio, o log
+        CRITICAL com o hash ainda é melhor que nada.
+        """
+        destino = self._persistence_path.parent / BLOCKS_DIRNAME
+        arquivo = destino / f"{int(candidato.found_at)}-{candidato.job_id}.json"
+        try:
+            destino.mkdir(parents=True, exist_ok=True)
+            arquivo.write_text(json.dumps(asdict(candidato), indent=2))
+        except OSError as exc:
+            logger.critical(
+                "BLOCO ENCONTRADO e não foi possível gravar %s (%s) — o header está no log",
+                arquivo,
+                exc,
+            )
+            return
+        logger.critical("candidato de bloco gravado em %s", arquivo)
 
     def set_calibration(self, max_hashrate: float, joules_per_hash: float | None) -> None:
         """Grava o resultado da calibração de inicialização do daemon.
@@ -229,10 +310,16 @@ class SharedState:
             self._current_ntime = ntime
             self._current_job_explanation = explanation
 
-    def update_extranonce2(self, extranonce2: bytes) -> None:
-        """Registrado pelo `on_extranonce2_change` de `core.hasher.mine_job`."""
+    def set_coinbase_pays_us(self, satoshis: int | None) -> None:
+        """Registra o resultado da conferência de destino do job atual.
+
+        Args:
+            satoshis: total que a coinbase deste job paga ao endereço
+                configurado; `0` se não paga nada, `None` se a coinbase não
+                pôde ser percorrida (ver `core.payout.coinbase_payout_to`).
+        """
         with self._lock:
-            self._current_extranonce2 = extranonce2.hex()
+            self._coinbase_pays_us_satoshis = satoshis
 
     def set_connection_state(self, state: str) -> None:
         with self._lock:
@@ -301,7 +388,7 @@ class SharedState:
                 "current_job_id": self._current_job_id,
                 "current_block_height": self._current_block_height,
                 "current_ntime": self._current_ntime,
-                "current_extranonce2": self._current_extranonce2,
+                "current_nonce": self._current_nonce,
                 "current_job_explanation": self._current_job_explanation,
                 "pool_difficulty": self._pool_difficulty,
                 "network_difficulty": self._network_difficulty,
@@ -314,6 +401,7 @@ class SharedState:
                 "best_difficulty_ever": self._persisted.best_difficulty_ever,
                 "best_difficulty_ever_timestamp": self._persisted.best_difficulty_ever_timestamp,
                 "blocks_found": self._blocks_found,
+                "blocks_found_total": self._persisted.blocks_found_total,
                 "connection_state": self._connection_state,
                 "last_share_timestamp": self._last_share_timestamp,
                 "cpu_usage_percent": self._cpu_usage_percent,
@@ -327,4 +415,5 @@ class SharedState:
                 "cost_session_brl": cost_session_brl,
                 "cost_total_brl": cost_total_brl,
                 "target_hashrate": self._target_hashrate,
+                "coinbase_pays_us_satoshis": self._coinbase_pays_us_satoshis,
             }

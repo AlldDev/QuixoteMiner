@@ -15,7 +15,9 @@ from types import FrameType
 
 from quixote import envfile
 from quixote.core.hasher import calibrate_max_hashrate, check_target_reachable, mine_job
-from quixote.core.job import Job, Share, parse_coinbase_height
+from quixote.core.job import BlockCandidate, Job, Share, parse_coinbase_height
+from quixote.core.merkle import build_coinbase
+from quixote.core.payout import address_to_script_pubkey, coinbase_payout_to
 from quixote.core.target import difficulty_to_target, nbits_to_target, target_to_difficulty
 from quixote.net.stratum import StratumClient
 from quixote.telemetry import ipc
@@ -143,6 +145,15 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     if not address:
         raise SystemExit("defina BTC_ADDRESS em .env antes de rodar o daemon")
 
+    # o pool responde `result: true` no mining.authorize pra praticamente
+    # qualquer string, então a autorização não valida nada — um typo ou um
+    # endereço de testnet só apareceria no dia do bloco, quando não há mais
+    # o que fazer. Decodificar aqui falha na partida, de graça.
+    try:
+        script_pubkey_esperado = address_to_script_pubkey(address)
+    except ValueError as exc:
+        raise SystemExit(f"BTC_ADDRESS em .env é inválido: {exc}") from None
+
     if target_hashrate is None:
         target_hashrate = _read_target_hashrate(env)
 
@@ -156,6 +167,15 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
 
     running = threading.Event()
     running.set()
+
+    destino_conferido = threading.Event()
+    """Fica limpo até um job provar que a coinbase paga o `BTC_ADDRESS`.
+
+    Confere destino da recompensa, não recebimento: nada é pago sem bloco.
+    Começa limpo de propósito: enquanto nenhum job foi conferido, não há por
+    que hashear. Se um job deixar de conferir, o hasher para e volta sozinho
+    quando um job seguinte conferir — falha fechada, sem derrubar o serviço.
+    """
 
     def _handle_signal(signum: int, _frame: FrameType | None) -> None:
         logger.info("recebido sinal %s, desligando...", signal.Signals(signum).name)
@@ -192,9 +212,56 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     job_box = _JobBox()
     explained = False
 
+    def _verificar_destino_da_recompensa(job: Job) -> None:
+        """Confere se a coinbase deste job paga o endereço configurado.
+
+        Confere **destino**, não recebimento: sem bloco encontrado não existe
+        recompensa, e o valor que aparece no log é o subsídio + taxas deste
+        template, que o pool remonta a cada `mining.notify`.
+
+        Roda uma vez por job (nunca por nonce): o `scriptPubKey` das saídas
+        não depende do extranonce, então a coinbase é montada com um
+        `extranonce2` zerado só para ter uma transação bem formada de onde
+        percorrer as saídas.
+        """
+        coinbase = build_coinbase(
+            job.coinb1,
+            client.extranonce1,
+            "00" * client.extranonce2_size,
+            job.coinb2,
+        )
+        satoshis = coinbase_payout_to(coinbase, script_pubkey_esperado)
+        state.set_coinbase_pays_us(satoshis)
+        if satoshis is None:
+            destino_conferido.clear()
+            logger.critical(
+                "coinbase do job %s não pôde ser percorrida — mineração parada, "
+                "não dá para afirmar que o pagamento é seu",
+                job.job_id,
+            )
+        elif satoshis == 0:
+            destino_conferido.clear()
+            logger.critical(
+                "coinbase do job %s paga OUTRO endereço, não %s — mineração parada",
+                job.job_id,
+                address,
+            )
+        else:
+            if not destino_conferido.is_set():
+                logger.info(
+                    "destino da recompensa conferido: a coinbase do job %s pagaria "
+                    "%.8f BTC (subsídio + taxas deste template) em %s se um hash "
+                    "bater o target da rede",
+                    job.job_id,
+                    satoshis / 1e8,
+                    address,
+                )
+            destino_conferido.set()
+
     def _on_job(job: Job) -> None:
         nonlocal explained
         job_box.set(job)
+        _verificar_destino_da_recompensa(job)
         network_difficulty = target_to_difficulty(nbits_to_target(job.nbits))
         block_height = parse_coinbase_height(job.coinb1)
         explicacao = montar_explicacao_job(
@@ -205,6 +272,7 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
             target_hashrate,
             batch_size,
             state.calibrated_max_hashrate,
+            script_pubkey_esperado,
         )
         state.update_job(
             job.job_id,
@@ -224,6 +292,7 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
                 target_hashrate,
                 batch_size,
                 state.calibrated_max_hashrate,
+                script_pubkey_esperado,
             )
 
     stratum_thread = threading.Thread(
@@ -242,14 +311,30 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     def _hasher_loop() -> None:
         while running.is_set():
             job = job_box.job
-            if job is None:
+            if job is None or not destino_conferido.is_set():
                 time.sleep(0.2)
                 continue
 
             version = job_box.version
+            epoch = client.session_epoch
             target_pool = difficulty_to_target(client.pool_difficulty)
+            # lista, e não uma variável com `nonlocal`, pra poder ser passada
+            # como argumento default às duas closures — é como o resto deste
+            # laço evita capturar variável de iteração por referência
+            blocos_deste_job: list[BlockCandidate] = []
 
-            def _submit(extranonce2: bytes, nonce: int, _job: Job = job) -> None:
+            def _on_block_found(
+                candidato: BlockCandidate, _blocos: list[BlockCandidate] = blocos_deste_job
+            ) -> None:
+                _blocos.append(candidato)
+                state.record_block_found(candidato)
+
+            def _submit(
+                extranonce2: bytes,
+                nonce: int,
+                _job: Job = job,
+                _blocos: list[BlockCandidate] = blocos_deste_job,
+            ) -> None:
                 share = Share(
                     worker=worker,
                     job_id=_job.job_id,
@@ -257,29 +342,55 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
                     ntime=_job.ntime,
                     nonce=nonce,
                 )
-                client.submit(share)
+                if client.submit(share):
+                    return
+                bloco = next((b for b in _blocos if b.nonce == nonce), None)
+                if bloco is not None:
+                    logger.critical(
+                        "BLOCO NÃO ENVIADO (sem conexão no instante do envio): hash=%s, "
+                        "candidato gravado em disco, remontável a partir do header",
+                        bloco.block_hash_display,
+                    )
+                    # ponytail: sem reenvio automático, o extranonce1 da sessão
+                    # nova invalida a share e o pool recusaria o job_id antigo
+                else:
+                    logger.warning("share do job %s perdida: sem conexão", _job.job_id)
 
-            def _on_batch(hashes_no_lote: int, elapsed: float) -> None:
+            def _on_batch(hashes_no_lote: int, elapsed: float, start_nonce: int) -> None:
                 hashrate_instant = hashes_no_lote / elapsed if elapsed > 0 else 0.0
-                state.update_hashrate(hashrate_instant, hashes_no_lote)
+                state.update_hashrate(hashrate_instant, hashes_no_lote, start_nonce)
 
-            def _should_continue(_version: int = version) -> bool:
-                return job_box.version == _version and running.is_set()
+            def _should_continue(_version: int = version, _epoch: int = epoch) -> bool:
+                # o epoch entra junto da versão do job: uma reconexão troca o
+                # extranonce1 sem necessariamente trazer um clean_jobs, e
+                # continuar com o antigo produz coinbase inválida
+                return (
+                    job_box.version == _version
+                    and client.session_epoch == _epoch
+                    and destino_conferido.is_set()
+                    and running.is_set()
+                )
 
-            mine_job(
-                job,
-                client.extranonce1,
-                client.extranonce2_size,
-                target_pool,
-                on_share=_submit,
-                should_continue=_should_continue,
-                batch_size=batch_size,
-                target_hashrate=target_hashrate,
-                on_batch=_on_batch,
-                on_share_difficulty=state.record_share_found,
-                on_extranonce2_change=state.update_extranonce2,
-                on_block_found=state.record_block_found,
-            )
+            try:
+                mine_job(
+                    job,
+                    client.extranonce1,
+                    client.extranonce2_size,
+                    target_pool,
+                    on_share=_submit,
+                    should_continue=_should_continue,
+                    batch_size=batch_size,
+                    target_hashrate=target_hashrate,
+                    on_batch=_on_batch,
+                    on_share_difficulty=state.record_share_found,
+                    on_block_found=_on_block_found,
+                )
+            except Exception:
+                # esta thread não é reiniciada por ninguém: qualquer exceção
+                # que escapasse daqui pararia a mineração em definitivo com o
+                # processo vivo e o painel desenhando normalmente
+                logger.exception("erro no laço de mineração do job %s, seguindo", job.job_id)
+                time.sleep(1.0)
 
     hasher_thread = threading.Thread(target=_hasher_loop, daemon=True, name="hasher")
     hasher_thread.start()
@@ -299,10 +410,25 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     last_rejected = 0
     last_power_strategy: str | None = None
     last_kwh_total = power_meter.kwh_total
+    threads_mortas: set[str] = set()
 
     while running.is_set():
         time.sleep(MONITOR_INTERVAL_SECONDS)
+        if not running.is_set():
+            # o sinal pode chegar durante o sleep: sem isto, o resto do corpo
+            # roda uma última vez com as threads já se encerrando e a
+            # supervisão abaixo acusa "thread morreu" num desligamento normal
+            break
         state.set_connection_state(client.connection_state)
+
+        for thread in (hasher_thread, stratum_thread, ipc_thread):
+            if not thread.is_alive() and thread.name not in threads_mortas:
+                # nenhuma delas deveria morrer antes do shutdown; se morrer, o
+                # processo continua vivo e o painel continua desenhando, então
+                # o log é o único lugar onde isso pode aparecer. Uma vez só:
+                # o monitor passa por aqui a cada segundo.
+                threads_mortas.add(thread.name)
+                logger.critical("thread %s morreu — reinicie o daemon", thread.name)
 
         now_cpu = time.process_time()
         now_wall = time.monotonic()

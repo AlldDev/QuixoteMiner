@@ -19,7 +19,7 @@ def test_to_dict_traz_todos_os_campos(tmp_path):
         "current_job_id",
         "current_block_height",
         "current_ntime",
-        "current_extranonce2",
+        "current_nonce",
         "pool_difficulty",
         "network_difficulty",
         "shares_accepted",
@@ -31,6 +31,7 @@ def test_to_dict_traz_todos_os_campos(tmp_path):
         "best_difficulty_ever",
         "best_difficulty_ever_timestamp",
         "blocks_found",
+        "blocks_found_total",
         "connection_state",
         "last_share_timestamp",
         "cpu_usage_percent",
@@ -69,12 +70,34 @@ def test_update_hashrate_acumula_hashes_total(tmp_path):
     assert snapshot["hashrate_instant"] == 1500.0
 
 
-def test_record_block_found_acumula_contador(tmp_path):
-    state = SharedState(persistence_path=tmp_path / "state.json")
-    state.record_block_found()
-    state.record_block_found()
+def test_record_block_found_acumula_na_sessao_e_persiste_o_total(tmp_path, bloco_candidato):
+    """Bloco encontrado é o evento central do projeto — a contagem de sempre
+    não pode morrer num restart do serviço."""
+    path = tmp_path / "state.json"
+    state1 = SharedState(persistence_path=path)
+    state1.record_block_found(bloco_candidato)
+    state1.record_block_found(bloco_candidato)
 
-    assert state.to_dict()["blocks_found"] == 2
+    assert state1.to_dict()["blocks_found"] == 2
+    assert state1.to_dict()["blocks_found_total"] == 2
+
+    state2 = SharedState(persistence_path=path)
+    assert state2.to_dict()["blocks_found"] == 0  # sessão nova, zerada
+    assert state2.to_dict()["blocks_found_total"] == 2
+
+
+def test_update_hashrate_guarda_o_nonce_do_lote(tmp_path):
+    """O nonce é posição no espaço do job atual, não contador acumulado:
+    o valor novo substitui o anterior, inclusive quando volta pra trás
+    (job novo reiniciando a varredura do zero)."""
+    state = SharedState(persistence_path=tmp_path / "state.json")
+
+    state.update_hashrate(350_000.0, hashes_no_lote=50_000, nonce_atual=100_000)
+    assert state.to_dict()["current_nonce"] == 100_000
+
+    state.update_hashrate(350_000.0, hashes_no_lote=50_000, nonce_atual=0)
+    assert state.to_dict()["current_nonce"] == 0
+    assert state.to_dict()["hashes_total"] == 100_000  # esse sim acumula
 
 
 def test_update_hashrate_amostra_historico_por_tempo_nao_por_chamada(tmp_path, monkeypatch):
@@ -264,12 +287,10 @@ def test_update_job_propaga_altura_ntime_e_target_hashrate(tmp_path):
         block_height=965063,
         ntime=1788394021,
     )
-    state.update_extranonce2(b"\x00\x00\x00\x1a")
 
     snapshot = state.to_dict()
     assert snapshot["current_block_height"] == 965063
     assert snapshot["current_ntime"] == 1788394021
-    assert snapshot["current_extranonce2"] == "0000001a"
     assert snapshot["target_hashrate"] == 350_000.0
 
     # job sem altura conhecida (parse_coinbase_height falhou) não quebra nada
@@ -318,3 +339,34 @@ def test_mutacao_concorrente_nao_perde_contagem(tmp_path):
         t.join()
 
     assert state.to_dict()["shares_accepted"] == 800
+
+
+def test_record_block_found_grava_arquivo_por_candidato(tmp_path, bloco_candidato):
+    """O contador não basta: sem os campos do header em disco, um bloco cuja
+    submissão falhe não é reconstruível (o log fica em INFO, sem o
+    `mining.notify`, e ainda rotaciona)."""
+    state = SharedState(persistence_path=tmp_path / "state.json")
+    state.record_block_found(bloco_candidato)
+
+    arquivos = list((tmp_path / "blocks").glob("*.json"))
+    assert len(arquivos) == 1
+    assert bloco_candidato.job_id in arquivos[0].name
+
+    gravado = json.loads(arquivos[0].read_text())
+    assert gravado["header"] == bloco_candidato.header
+    assert gravado["block_hash_display"] == bloco_candidato.block_hash_display
+    assert gravado["extranonce1"] == bloco_candidato.extranonce1
+    assert gravado["coinb2"] == bloco_candidato.coinb2
+    assert gravado["nonce"] == bloco_candidato.nonce
+
+
+def test_save_persisted_e_atomico(tmp_path, bloco_candidato):
+    """`update_power` reescreve o state.json uma vez por segundo, para sempre;
+    um truncamento no meio zeraria `blocks_found_total` em silêncio. A troca
+    tem que ser por rename, sem temporário sobrando."""
+    path = tmp_path / "state.json"
+    state = SharedState(persistence_path=path)
+    state.record_block_found(bloco_candidato)
+
+    assert json.loads(path.read_text())["blocks_found_total"] == 1
+    assert list(tmp_path.glob("*.tmp")) == []

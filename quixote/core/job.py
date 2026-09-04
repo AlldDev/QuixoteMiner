@@ -1,4 +1,4 @@
-"""Modelo de dados de um job de mineração e de uma share encontrada.
+"""Modelo de dados de um job, de uma share encontrada e de um bloco encontrado.
 
 Isola o parsing do protocolo Stratum (formato dos campos de `mining.notify`)
 da camada de rede, para que a conversão possa ser testada sem socket nenhum.
@@ -69,7 +69,7 @@ class Job:
         )
 
 
-def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
+def read_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Lê um `CompactSize` (varint do protocolo Bitcoin) a partir de `offset`.
 
     Returns:
@@ -111,9 +111,9 @@ def parse_coinbase_height(coinb1: str) -> int | None:
     try:
         data = bytes.fromhex(coinb1)
         offset = 4  # versão
-        _, offset = _read_varint(data, offset)  # contador de inputs
+        _, offset = read_varint(data, offset)  # contador de inputs
         offset += 32 + 4  # txid anterior + índice do output anterior
-        _, offset = _read_varint(data, offset)  # tamanho da scriptSig
+        _, offset = read_varint(data, offset)  # tamanho da scriptSig
         push_len = data[offset]
         if not 1 <= push_len <= 75:
             return None
@@ -166,3 +166,58 @@ class Share:
             f"{self.ntime:08x}",
             f"{self.nonce:08x}",
         ]
+
+
+@dataclass(frozen=True)
+class BlockCandidate:
+    """Tudo que é necessário para remontar e propagar um bloco encontrado.
+
+    Existe por um motivo operacional, não estético: quem propaga o bloco é o
+    pool, e a única confirmação é o `{"result": true}` do `mining.submit`. Se
+    o envio falhar — socket caindo no instante exato, pool fora do ar — o
+    trabalho de 4,89 × 10¹⁰ anos-máquina não pode sobrar só numa linha de log
+    rotativo. Com os campos abaixo gravados em disco, o header de 80 bytes é
+    reconstruível campo a campo e o bloco pode ser submetido à mão por
+    qualquer nó (`submitblock`), desde que a coinbase e as transações do
+    template sejam recuperadas junto com o pool.
+
+    Todos os campos de bytes ficam em hexadecimal, na ordem em que entram no
+    header (little-endian corrida, a convenção de `core.hashing`) — exceto
+    `block_hash_display`, invertido, que é a forma mostrada por explorador de
+    bloco e a única forma que serve para procurar o bloco depois.
+
+    Attributes:
+        found_at: `time.time()` do achado.
+        job_id: job do `mining.notify` que originou o header.
+        version: campo `version` do header.
+        prev_hash: hash do bloco anterior, 32 bytes, ordem interna.
+        coinb1: primeira metade da coinbase, como veio do pool.
+        coinb2: segunda metade da coinbase, como veio do pool.
+        merkle_branch: ramos de merkle, ordem interna, na ordem do pool.
+        nbits: dificuldade compacta do header.
+        ntime: timestamp do header, exatamente o que o pool mandou.
+        extranonce1: extranonce fixo desta sessão Stratum.
+        extranonce2: extranonce variável usado nesta coinbase.
+        nonce: nonce que satisfez o target da rede.
+        coinbase: transação coinbase completa e montada.
+        merkle_root: merkle root resultante, 32 bytes, ordem interna.
+        header: os 80 bytes exatos do header.
+        block_hash_display: `sha256d(header)` invertido, forma de exibição.
+    """
+
+    found_at: float
+    job_id: str
+    version: int
+    prev_hash: str
+    coinb1: str
+    coinb2: str
+    merkle_branch: list[str]
+    nbits: int
+    ntime: int
+    extranonce1: str
+    extranonce2: str
+    nonce: int
+    coinbase: str
+    merkle_root: str
+    header: str
+    block_hash_display: str
