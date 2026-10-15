@@ -107,8 +107,10 @@ número sem pedir senha. Em CPU sem esse contador exposto (AMD sem o driver
 de energia carregado, máquina virtual, ARM) não há o que liberar — o daemon
 avisa no log e segue com a estimativa.
 
-A calibração é refeita sozinha quando passa de 3 dias. Pra forçar antes
-disso, apague `~/.local/share/quixote/state.json` e reinicie o serviço —
+A calibração é refeita sozinha 1 vez ao dia, com o daemon rodando (o
+hasher pausa ~15s pra medir). Se a máquina estiver ocupada durante a janela
+e a medição sair absurda, a anterior segue valendo e o daemon tenta de novo
+em 30 min. Pra forçar antes disso, apague `~/.local/share/quixote/state.json` e reinicie o serviço —
 mas saiba o que vai embora junto: o recorde de dificuldade, o kWh acumulado,
 os totais de shares e o **contador de blocos encontrados**. Os arquivos de
 `~/.local/share/quixote/blocks/` (um por bloco encontrado, com o header

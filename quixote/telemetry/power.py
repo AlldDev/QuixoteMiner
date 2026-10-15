@@ -256,6 +256,11 @@ class PowerMeter:
         self._watts_sum = 0.0
         self._sample_count = 0
 
+    def set_joules_per_hash(self, value: float | None) -> None:
+        """Troca o custo por hash das próximas amostras (recalibração periódica
+        do daemon). O kWh já acumulado não é recalculado."""
+        self._joules_per_hash = value
+
     def sample(self, cpu_fraction: float, hashrate: float = 0.0) -> PowerReading:
         """Produz uma amostra de potência e acumula no total de kWh.
 

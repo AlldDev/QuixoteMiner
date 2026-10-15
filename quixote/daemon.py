@@ -34,25 +34,47 @@ limitação. `.env` (TARGET_HASHRATE) permite sobrescrever sem tocar aqui.
 `.env` ausente/quebrado, não uma configuração comum (ver `envfile.py`)."""
 MONITOR_INTERVAL_SECONDS = 1.0
 
-CALIBRATION_MAX_AGE_SECONDS = 3 * 24 * 3600
-"""Calibração mais velha que isso é refeita. Ela mede hardware (capacidade
-de hash e joules por hash), e hardware não muda sozinho — mas o resto muda:
-outro perfil de energia, outro kernel, o binário Rust recompilado, a máquina
-virada de mesa pra notebook na bateria. Três dias é a escolha do usuário
-(2026-09-03); o custo de errar pra menos é ~5s de inicialização."""
+CALIBRATION_MAX_AGE_SECONDS = 24 * 3600
+"""Calibração mais velha que isso é refeita — no startup e também com o
+daemon rodando (o monitor confere a cada segundo). Ela mede hardware
+(capacidade de hash e joules por hash), e hardware não muda sozinho — mas o
+resto muda: outro perfil de energia, boost, temperatura, outro kernel, o
+binário Rust recompilado. Um dia é a escolha do usuário (2026-10-15, antes
+três dias e só no startup); cada recalibração custa ~15s de hasher parado e
+algumas dezenas de joules."""
 
-CALIBRATION_IDLE_SECONDS = 2.0
+CALIBRATION_RETRY_SECONDS = 30 * 60
+"""Espera até tentar de novo quando uma recalibração periódica é descartada
+(máquina ocupada durante a janela): a anterior segue valendo até lá."""
+
+CALIBRATION_IDLE_SECONDS = 5.0
 """Janela ociosa medida antes da corrida de calibração, pra descontar do
 consumo o que a máquina já gastava parada."""
 
+CALIBRATION_BUSY_SECONDS = 10.0
+"""Duração da corrida sem throttle. Janelas de 2s/3s davam J/hash variando
+quase 2x entre medições seguidas (1,64 vs 2,71 µJ em 2026-10-15): qualquer
+atividade de fundo pesava demais. 5s/10s diluem esse ruído."""
 
-def _calibrar(state: SharedState) -> None:
+
+def _calibrar(state: SharedState, *, periodica: bool = False) -> bool:
     """Mede capacidade máxima de hash e custo energético por hash, e persiste.
 
     As duas saem da mesma corrida sem throttle: primeiro uma janela parada
     (linha de base do RAPL), depois `calibrate_max_hashrate` com o contador
-    de energia aberto em volta. Roda antes das threads de Stratum e do hasher
-    subirem, então o único ruído possível é de processos de fora.
+    de energia aberto em volta. No startup roda antes das threads de Stratum
+    e do hasher subirem; na periódica, com o hasher pausado por quem chama —
+    nos dois casos o único ruído possível é de processos de fora.
+
+    Args:
+        state: onde a calibração é gravada.
+        periodica: recalibração com o daemon já rodando. Aí uma medição
+            descartada (RAPL legível, mas delta absurdo) **não** é gravada:
+            a calibração anterior, boa, segue valendo em vez de virar `None`
+            e jogar o painel pra estratégia estimada.
+
+    Returns:
+        `False` só quando a periódica foi descartada; `True` quando gravou.
     """
     probe = EnergyProbe()
     if not probe.available:
@@ -64,16 +86,26 @@ def _calibrar(state: SharedState) -> None:
     logger.info("medindo linha de base ociosa (%.0fs)...", CALIBRATION_IDLE_SECONDS)
     idle_watts = probe.measure(CALIBRATION_IDLE_SECONDS)
 
-    logger.info("calibrando capacidade máxima da máquina (3s sem throttle)...")
+    logger.info(
+        "calibrando capacidade máxima da máquina (%.0fs sem throttle)...", CALIBRATION_BUSY_SECONDS
+    )
     probe.start()
-    max_hashrate = calibrate_max_hashrate()
+    max_hashrate = calibrate_max_hashrate(CALIBRATION_BUSY_SECONDS)
     busy_watts = probe.stop()
 
+    rapl_respondeu = idle_watts is not None and busy_watts is not None
     j_por_hash = (
-        joules_per_hash(idle_watts, busy_watts, max_hashrate)
-        if idle_watts is not None and busy_watts is not None
-        else None
+        joules_per_hash(idle_watts, busy_watts, max_hashrate) if rapl_respondeu else None
     )
+    if periodica and rapl_respondeu and j_por_hash is None:
+        logger.warning(
+            "recalibração descartada (ocioso %.2f W, sob carga %.2f W): a máquina não estava "
+            "parada o bastante — mantida a calibração anterior, nova tentativa em %.0f min",
+            idle_watts,
+            busy_watts,
+            CALIBRATION_RETRY_SECONDS / 60,
+        )
+        return False
     state.set_calibration(max_hashrate, j_por_hash)
 
     logger.info("capacidade calibrada: %.0f H/s", max_hashrate)
@@ -91,6 +123,7 @@ def _calibrar(state: SharedState) -> None:
             idle_watts,
             busy_watts,
         )
+    return True
 
 
 def _read_target_hashrate(env: dict[str, str]) -> float:
@@ -169,6 +202,10 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     running.set()
 
     destino_conferido = threading.Event()
+    # recalibração periódica: o monitor seta `calibrando` e espera o hasher
+    # confirmar que parou (`hasher_ocioso`) antes de medir a janela ociosa
+    calibrando = threading.Event()
+    hasher_ocioso = threading.Event()
     """Fica limpo até um job provar que a coinbase paga o `BTC_ADDRESS`.
 
     Confere destino da recompensa, não recebimento: nada é pago sem bloco.
@@ -310,6 +347,11 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
 
     def _hasher_loop() -> None:
         while running.is_set():
+            if calibrando.is_set():
+                hasher_ocioso.set()
+                time.sleep(0.1)
+                continue
+            hasher_ocioso.clear()
             job = job_box.job
             if job is None or not destino_conferido.is_set():
                 time.sleep(0.2)
@@ -360,14 +402,24 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
                 hashrate_instant = hashes_no_lote / elapsed if elapsed > 0 else 0.0
                 state.update_hashrate(hashrate_instant, hashes_no_lote, start_nonce)
 
-            def _should_continue(_version: int = version, _epoch: int = epoch) -> bool:
+            def _should_continue(
+                _version: int = version,
+                _epoch: int = epoch,
+                _difficulty: float = client.pool_difficulty,
+            ) -> bool:
                 # o epoch entra junto da versão do job: uma reconexão troca o
                 # extranonce1 sem necessariamente trazer um clean_jobs, e
-                # continuar com o antigo produz coinbase inválida
+                # continuar com o antigo produz coinbase inválida. A
+                # dificuldade também: o public-pool manda `set_difficulty`
+                # sem `clean_jobs` (100000 na largada, depois o sugerido), e
+                # sem reiniciar o target ficaria preso no valor antigo até o
+                # próximo job limpo
                 return (
                     job_box.version == _version
                     and client.session_epoch == _epoch
+                    and client.pool_difficulty == _difficulty
                     and destino_conferido.is_set()
+                    and not calibrando.is_set()
                     and running.is_set()
                 )
 
@@ -411,6 +463,7 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
     last_power_strategy: str | None = None
     last_kwh_total = power_meter.kwh_total
     threads_mortas: set[str] = set()
+    proxima_calibracao = 0.0
 
     while running.is_set():
         time.sleep(MONITOR_INTERVAL_SECONDS)
@@ -446,6 +499,24 @@ def run(target_hashrate: float | None = None, explain: bool = False) -> None:
         if reading.strategy != last_power_strategy:
             logger.info("estratégia de energia: %s (%.2f W)", reading.strategy, reading.watts)
             last_power_strategy = reading.strategy
+
+        idade = state.calibration_age_seconds
+        if (
+            idade is not None
+            and idade > CALIBRATION_MAX_AGE_SECONDS
+            and now_wall >= proxima_calibracao
+        ):
+            calibrando.set()
+            if not hasher_ocioso.wait(timeout=2.0):
+                logger.warning("hasher não pausou a tempo, recalibrando mesmo assim")
+            try:
+                ok = _calibrar(state, periodica=True)
+            finally:
+                calibrando.clear()
+            if ok:
+                power_meter.set_joules_per_hash(state.joules_per_hash)
+            else:
+                proxima_calibracao = time.monotonic() + CALIBRATION_RETRY_SECONDS
 
         if client.accepted_count > last_accepted:
             for _ in range(client.accepted_count - last_accepted):
