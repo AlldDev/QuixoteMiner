@@ -10,4 +10,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = "0.29.0"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
+
+# Build do .so usado pelo daemon: LTO e um codegen unit deixam o laço quente
+# inteiro visível pro otimizador. Sem target-cpu=native, pra o binário seguir
+# portável entre as máquinas (o SHA-NI já é detectado em runtime pelo sha2).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

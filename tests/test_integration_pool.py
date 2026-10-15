@@ -82,7 +82,8 @@ def test_primeira_share_aceita_pelo_public_pool(caplog):
                 continue
 
             version = job_box.version
-            target_pool = difficulty_to_target(client.pool_difficulty)
+            difficulty = client.pool_difficulty
+            target_pool = difficulty_to_target(difficulty)
 
             def _submit(extranonce2: bytes, nonce: int, _job: Job = job) -> None:
                 share = Share(
@@ -101,8 +102,11 @@ def test_primeira_share_aceita_pelo_public_pool(caplog):
                 target_pool,
                 on_share=_submit,
                 should_continue=(
-                    lambda v=version: (
+                    # `set_difficulty` chega sem `clean_jobs` (o public-pool
+                    # manda 100000 antes do sugerido): reinicia com o target novo
+                    lambda v=version, d=difficulty: (
                         job_box.version == v
+                        and client.pool_difficulty == d
                         and client.accepted_count == 0
                         and time.monotonic() < deadline
                     )

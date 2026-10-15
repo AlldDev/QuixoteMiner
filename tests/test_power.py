@@ -146,3 +146,16 @@ def test_kwh_total_acumula_ao_longo_de_varias_amostras():
     time.sleep(0.05)
     meter.sample(cpu_fraction=1.0)
     assert meter.kwh_total > 0.0
+
+
+def test_set_joules_per_hash_troca_a_estrategia_das_proximas_amostras():
+    meter = PowerMeter(tdp_watts=65.0)
+    assert meter.sample(0.5, hashrate=1_000_000).strategy == STRATEGY_MODEL
+
+    meter.set_joules_per_hash(2e-6)
+    leitura = meter.sample(0.5, hashrate=1_000_000)
+    assert leitura.strategy == STRATEGY_MEASURED
+    assert leitura.watts == 2.0
+
+    meter.set_joules_per_hash(None)
+    assert meter.sample(0.5, hashrate=1_000_000).strategy == STRATEGY_MODEL
